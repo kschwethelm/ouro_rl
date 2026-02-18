@@ -1,0 +1,24 @@
+# Local files
+*.core
+*.out
+datasets/
+models/
+outputs*/
+slurm_logs/
+knowledge/
+checkpoints/
+
+# Python
+*$py.class
+*.py[cod]
+*.pyc
+__pycache__/
+
+# Ruff
+.ruff_cache/
+
+# UV
+.venv/
+
+# W&B
+wandb/
