@@ -152,20 +152,22 @@ def grpo_loss(
     """
     adv = advantages.unsqueeze(1)  # (batch,) → (batch, 1) for broadcasting
 
-    if old_log_probs is not None:
+    if old_log_probs is not None:  # noqa: SIM108
         # Per-token policy ratio in log-space.
         log_ratio = policy_log_probs - old_log_probs  # (batch, seq_len)
-        ratio = torch.exp(log_ratio.clamp(-10, 10))
-
-        # Clipped surrogate.
-        surr1 = ratio * adv
-        surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
-        token_surrogate = torch.min(surr1, surr2)
     else:
-        # num_iterations=1 → old == policy, so ratio is exactly 1.0 and clipping is a no-op.
-        # Skip the redundant forward pass but keep the same loss semantics as PPO branch.
-        ratio = None
-        token_surrogate = adv
+        # num_iterations=1 → old == policy, so ratio evaluates to 1.0 and clipping
+        # is a no-op. We still need the gradient path through policy_log_probs,
+        # so compute ratio as exp(log_π - log_π.detach()) which is 1.0 in value
+        # but has ∂ratio/∂θ = ∂log_π/∂θ (REINFORCE gradient).
+        log_ratio = policy_log_probs - policy_log_probs.detach()
+
+    ratio = torch.exp(log_ratio.clamp(-10, 10))
+
+    # Clipped surrogate.
+    surr1 = ratio * adv
+    surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
+    token_surrogate = torch.min(surr1, surr2)
 
     total_response_tokens = response_mask.sum().clamp(min=1)
 
@@ -182,13 +184,9 @@ def grpo_loss(
 
     metrics: dict[str, float] = {"surrogate_loss": surrogate_loss.item()}
 
-    if ratio is not None:
-        is_clipped = ((ratio < 1.0 - clip_eps) | (ratio > 1.0 + clip_eps)) & response_mask.bool()
-        metrics["mean_ratio"] = ratio[response_mask.bool()].mean().item() if response_mask.any() else 1.0
-        metrics["clip_ratio"] = is_clipped.sum().float().item() / total_response_tokens.item()
-    else:
-        metrics["mean_ratio"] = 1.0
-        metrics["clip_ratio"] = 0.0
+    is_clipped = ((ratio < 1.0 - clip_eps) | (ratio > 1.0 + clip_eps)) & response_mask.bool()
+    metrics["mean_ratio"] = ratio[response_mask.bool()].mean().item() if response_mask.any() else 1.0
+    metrics["clip_ratio"] = is_clipped.sum().float().item() / total_response_tokens.item()
 
     # Optional KL penalty (policy vs reference).
     if kl_coeff > 0:

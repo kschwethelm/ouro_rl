@@ -62,9 +62,7 @@ def main() -> None:
     # Tokenize all prompts.
     prompt_lengths: list[int] = []
     for problem in problems:
-        prompt_str = format_prompt(
-            problem, tokenizer, system_prompt=args.system_prompt, enable_thinking=args.enable_thinking
-        )
+        prompt_str = format_prompt(problem, tokenizer, system_prompt=args.system_prompt, enable_thinking=args.enable_thinking)
         token_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
         prompt_lengths.append(len(token_ids))
 

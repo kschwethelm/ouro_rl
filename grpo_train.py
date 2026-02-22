@@ -24,12 +24,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 
 from ouro_rl.data import CHAT_TEMPLATE, format_prompt, load_math_train
 from ouro_rl.grpo import compute_advantages, compute_log_probs_batch, compute_log_probs_with_grad, grpo_loss
-from ouro_rl.patches import patch_ouro, patch_ouro_post_load
+from ouro_rl.patches import CORRECT_EOS_TOKEN_ID, patch_ouro, patch_ouro_post_load
 from ouro_rl.reward import score_answer
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,7 @@ class GRPOConfig:
     # Model
     model_name: str = "ByteDance/Ouro-1.4B-Thinking"
     dtype: str = "bfloat16"
-    max_model_len: int = 4096  # vLLM context window (covers all prompts + 2048 generation)
+    max_model_len: int = 4096  # vLLM context window (prompt avg 89, response p75 = 2793)
 
     # Dataset
     dataset_name: str = "qwedsacf/competition_math"
@@ -59,7 +59,7 @@ class GRPOConfig:
     rollouts_per_prompt: int = 8
     lr: float = 1e-6
     max_grad_norm: float = 0.1
-    warmup_steps: int = 14  # 10% of 140
+    warmup_steps: int = 0
     weight_decay: float = 0.01
 
     # GRPO
@@ -67,12 +67,12 @@ class GRPOConfig:
     kl_coeff: float = 0.0  # KL not needed with verifiable rewards (DAPO, Open-Reasoner-Zero)
     scale_rewards: str = "batch"  # "batch" (group mean, batch std), "group" (per-group std), "none" (no std)
     num_iterations: int = 1  # μ: number of policy updates per generation batch
-    mask_truncated_completions: bool = True  # Zero out loss for completions that didn't terminate with EOS
+    mask_truncated_completions: bool = False  # Include truncated completions (reward=0 → negative advantage teaches brevity)
     token_level_loss: bool = True  # Token-level average (avoids length bias) vs per-sequence average
 
     # Generation
-    max_new_tokens: int = 2048
-    temperature: float = 0.7
+    max_new_tokens: int = 3072
+    temperature: float = 1.0
     top_p: float = 0.95
     enable_thinking: bool = True
 
@@ -87,6 +87,9 @@ class GRPOConfig:
     keep_last_n_checkpoints: int = 2  # Delete older checkpoints to save disk (0 = keep all)
     wandb_project: str = "ouro-rl"
     wandb_enabled: bool = True
+
+    # Reproducibility
+    seed: int = 42
 
     # Smoke test overrides
     smoke_test: bool = False
@@ -113,20 +116,28 @@ class GRPOConfig:
 
 def generate_rollouts(
     model_path: str,
-    prompts: list[str],
+    prompt_token_ids: list[list[int]],
     sampling_params: SamplingParams,
     *,
     dtype: str = "bfloat16",
     max_model_len: int = 4096,
     trust_remote_code: bool = True,
-) -> list[list[str]]:
+) -> list[list[list[int]]]:
     """Generate multiple rollouts per prompt using vLLM.
 
     Creates a vLLM LLM instance, generates, then destroys it to free GPU memory.
     Number of rollouts per prompt is controlled by sampling_params.n.
 
+    Accepts pre-tokenized prompt_token_ids and skips vLLM's tokenizer entirely
+    (skip_tokenizer_init=True). The caller controls tokenization (correct
+    bos/eos/pad) and must decode response token IDs externally.
+
+    Whether a response completed naturally (vs hitting max_tokens) can be
+    determined by checking if the last token is EOS — the stop token is
+    included in token_ids when skip_special_tokens=False.
+
     Returns:
-        List of lists: outer=prompts, inner=rollouts per prompt.
+        response_token_ids: [prompt_idx][rollout_idx] list of token ID lists.
     """
     llm = LLM(
         model=model_path,
@@ -134,15 +145,19 @@ def generate_rollouts(
         dtype=dtype,
         max_model_len=max_model_len,
         enforce_eager=True,  # Simpler, avoids CUDA graph issues with model swapping.
+        skip_tokenizer_init=True,
     )
-    outputs = llm.generate(prompts, sampling_params)
+    outputs = llm.generate(
+        [{"prompt_token_ids": ids} for ids in prompt_token_ids],
+        sampling_params,
+    )
 
     # Clean up vLLM completely.
     del llm
     gc.collect()
     torch.cuda.empty_cache()
 
-    return [[out.text for out in output.outputs] for output in outputs]
+    return [[list(out.token_ids) for out in output.outputs] for output in outputs]
 
 
 # ---------------------------------------------------------------------------
@@ -150,30 +165,26 @@ def generate_rollouts(
 # ---------------------------------------------------------------------------
 
 
-def tokenize_prompt_response_pairs(
-    tokenizer: PreTrainedTokenizerBase,
-    prompts: list[str],
-    responses: list[str],
+def pad_token_id_pairs(
+    prompt_ids_list: list[list[int]],
+    response_ids_list: list[list[int]],
     max_length: int,
+    pad_token_id: int = 0,
 ) -> dict[str, torch.Tensor]:
-    """Tokenize prompt+response pairs, returning input_ids, attention_mask, response_start_indices, response_mask.
+    """Left-pad prompt+response token ID pairs into batched tensors.
 
-    Left-pads sequences to max_length for batch processing.
+    Returns input_ids, attention_mask, response_start_indices, response_mask.
     """
     all_input_ids = []
     all_response_starts = []
 
-    for prompt, response in zip(prompts, responses):
-        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        response_ids = tokenizer.encode(response, add_special_tokens=False)
-
+    for prompt_ids, response_ids in zip(prompt_ids_list, response_ids_list):
         # Truncate response if prompt+response exceeds max_length.
         max_resp_len = max_length - len(prompt_ids)
         if max_resp_len <= 0:
             # Prompt itself is too long — truncate prompt from the left.
             prompt_ids = prompt_ids[-(max_length - 1) :]
             response_ids = response_ids[:1]
-            max_resp_len = 1
         else:
             response_ids = response_ids[:max_resp_len]
 
@@ -187,10 +198,9 @@ def tokenize_prompt_response_pairs(
     padded_mask = []
     adjusted_starts = []
 
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     for ids, resp_start in zip(all_input_ids, all_response_starts):
         pad_len = max_len - len(ids)
-        padded_ids.append([pad_id] * pad_len + ids)
+        padded_ids.append([pad_token_id] * pad_len + ids)
         padded_mask.append([0] * pad_len + [1] * len(ids))
         adjusted_starts.append(resp_start + pad_len)
 
@@ -300,10 +310,11 @@ def train_step(
         for k, v in metrics.items():
             total_metrics[k] = total_metrics.get(k, 0.0) + v / num_micro_batches
 
-    torch.nn.utils.clip_grad_norm_(policy_model.parameters(), config.max_grad_norm)
+    grad_norm = torch.nn.utils.clip_grad_norm_(policy_model.parameters(), config.max_grad_norm)
     optimizer.step()
     scheduler.step()
 
+    total_metrics["grad_norm"] = grad_norm.item()
     total_metrics["lr"] = scheduler.get_last_lr()[0]
     return total_metrics
 
@@ -313,8 +324,16 @@ def train_step(
 # ---------------------------------------------------------------------------
 
 
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
 def main(config: GRPOConfig) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
+
+    set_seed(config.seed)
 
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -345,11 +364,16 @@ def main(config: GRPOConfig) -> None:
     logger.info("Loaded %d problems", len(problems))
 
     # vLLM sampling params.
+    # NOTE: stop_token_ids is required because the upstream Ouro model ships
+    # with eos_token_id=0 (<|endoftext|>) in both tokenizer and model config.
+    # vLLM reads that and never stops on <|im_end|> (id=2), causing every
+    # completion to hit max_tokens and be flagged as truncated.
     sampling_params = SamplingParams(
         n=config.rollouts_per_prompt,
         temperature=config.temperature,
         top_p=config.top_p,
         max_tokens=config.max_new_tokens,
+        stop_token_ids=[CORRECT_EOS_TOKEN_ID],
         skip_special_tokens=False,  # Keep <think>...</think> for reward parsing.
     )
 
@@ -414,31 +438,64 @@ def main(config: GRPOConfig) -> None:
             format_prompt(p, tokenizer, system_prompt=config.system_prompt, enable_thinking=config.enable_thinking)
             for p in batch_problems
         ]
+        # Tokenize prompts once with correctly-configured HF tokenizer.
+        # vLLM receives token IDs directly, bypassing its internal tokenizer
+        # (which has wrong bos/eos/pad from upstream Ouro config).
+        prompt_token_ids = [tokenizer.encode(p) for p in prompts]
 
         # --- 2. Generate rollouts with vLLM ---
         logger.info("[Step %d/%d] Generating %d rollouts...", step, config.num_steps, config.total_rollouts_per_step)
 
-        # Move training models to CPU to free GPU memory for vLLM.
+        # Move training models + optimizer state to CPU to free GPU memory for vLLM.
         policy_model.cpu()
         if ref_model is not None:
             ref_model.cpu()
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.cpu()
         torch.cuda.empty_cache()
 
         gen_start = time.time()
-        rollout_texts = generate_rollouts(
+        rollout_response_ids = generate_rollouts(
             current_model_path,
-            prompts,
+            prompt_token_ids,
             sampling_params,
             dtype=config.dtype,
             max_model_len=config.max_model_len,
         )
         gen_time = time.time() - gen_start
 
-        # Move training models back to GPU.
+        # Decode response token IDs to text (vLLM skips tokenizer, so we do it here).
+        rollout_texts = [[tokenizer.decode(ids) for ids in prompt_rollouts] for prompt_rollouts in rollout_response_ids]
+
+        # Completion length stats (computed early so skipped steps can still log them).
+        all_response_lengths = [len(ids) for prompt_rollouts in rollout_response_ids for ids in prompt_rollouts]
+        mean_completion_len = sum(all_response_lengths) / len(all_response_lengths)
+        max_completion_len = max(all_response_lengths)
+        min_completion_len = min(all_response_lengths)
+        clipped_ratio = sum(
+            1
+            for prompt_rollouts in rollout_response_ids
+            for ids in prompt_rollouts
+            if not ids or ids[-1] != CORRECT_EOS_TOKEN_ID
+        ) / len(all_response_lengths)
+        completion_log_data = {
+            "completions/mean_length": mean_completion_len,
+            "completions/max_length": max_completion_len,
+            "completions/min_length": min_completion_len,
+            "completions/clipped_ratio": clipped_ratio,
+        }
+
+        # Move training models + optimizer state back to GPU.
         device = torch.device("cuda")
         policy_model.to(device)
         if ref_model is not None:
             ref_model.to(device)
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
 
         # --- 3. Score rollouts ---
         rewards_list: list[list[float]] = []
@@ -459,6 +516,7 @@ def main(config: GRPOConfig) -> None:
 
         # Skip step if all advantages are zero (no learning signal).
         if (advantages == 0).all():
+            step_time = time.time() - step_start
             logger.info(
                 "[Step %d/%d] All-zero advantages (reward=%.3f), skipping update.",
                 step,
@@ -469,35 +527,58 @@ def main(config: GRPOConfig) -> None:
                 import wandb
 
                 wandb.log(
-                    {"step": step, "reward/mean": mean_reward, "reward/fraction_correct": fraction_correct, "skipped": True}
+                    {
+                        "step": step,
+                        "reward/mean": mean_reward,
+                        "reward/fraction_correct": fraction_correct,
+                        "reward/kept_mean": mean_reward,
+                        "reward/kept_fraction_correct": fraction_correct,
+                        "reward/frac_zero_std": frac_reward_zero_std,
+                        **completion_log_data,
+                        "time/step_total": step_time,
+                        "time/generation": gen_time,
+                        "time/training": 0.0,
+                        "train/surrogate_loss": 0.0,
+                        "train/mean_ratio": 1.0,
+                        "train/clip_ratio": 0.0,
+                        "train/grad_norm": 0.0,
+                        "train/lr": scheduler.get_last_lr()[0],
+                        "skipped": True,
+                    }
                 )
             continue
 
         # Flatten: (num_prompts, rollouts) → (total_rollouts,)
         flat_advantages = advantages.reshape(-1)
 
-        # Build flat lists of prompts and responses for tokenization.
-        flat_prompts = [prompts[i] for i in range(config.prompt_batch_size) for _ in range(config.rollouts_per_prompt)]
-        flat_responses = [
-            rollout_texts[i][j] for i in range(config.prompt_batch_size) for j in range(config.rollouts_per_prompt)
+        # Build flat lists for tokenization and reward filtering.
+        flat_prompt_ids = [
+            prompt_token_ids[i] for i in range(config.prompt_batch_size) for _ in range(config.rollouts_per_prompt)
         ]
-        all_responses = list(flat_responses)  # Defensive copy for length stats before filtering.
-
+        flat_response_ids = [
+            rollout_response_ids[i][j] for i in range(config.prompt_batch_size) for j in range(config.rollouts_per_prompt)
+        ]
         # --- 5. Filter truncated completions (no EOS → no learning signal) ---
         # Drop them before tokenization to avoid wasting compute on zero-gradient sequences.
-        clipped_ratio = 0.0
+        # A response that completed naturally ends with EOS (stop token is included
+        # in token_ids). Truncated responses (hit max_tokens) won't have it.
+        kept_reward_mean = mean_reward
+        kept_fraction_correct = fraction_correct
         if config.mask_truncated_completions:
-            eos_token = tokenizer.eos_token
-            keep = [r.endswith(eos_token) for r in flat_responses]
-            n_total = len(flat_responses)
+            keep = [r[-1] == CORRECT_EOS_TOKEN_ID if r else False for r in flat_response_ids]
+            n_total = len(flat_response_ids)
             n_truncated = n_total - sum(keep)
-            clipped_ratio = n_truncated / n_total
 
             if n_truncated > 0 and n_truncated < n_total:
-                flat_prompts = [p for p, k in zip(flat_prompts, keep) if k]
-                flat_responses = [r for r, k in zip(flat_responses, keep) if k]
+                flat_prompt_ids = [p for p, k in zip(flat_prompt_ids, keep) if k]
+                flat_response_ids = [r for r, k in zip(flat_response_ids, keep) if k]
                 flat_advantages = flat_advantages[torch.tensor(keep)]
+                # Reward stats for non-truncated samples only.
+                kept_rewards = rewards.reshape(-1)[torch.tensor(keep)]
+                kept_reward_mean = kept_rewards.mean().item()
+                kept_fraction_correct = (kept_rewards > 0).float().mean().item()
             elif n_truncated == n_total:
+                step_time = time.time() - step_start
                 logger.info(
                     "[Step %d/%d] All completions truncated, skipping update.",
                     step,
@@ -511,15 +592,27 @@ def main(config: GRPOConfig) -> None:
                             "step": step,
                             "reward/mean": mean_reward,
                             "reward/fraction_correct": fraction_correct,
-                            "completions/clipped_ratio": 1.0,
+                            "reward/kept_mean": 0.0,
+                            "reward/kept_fraction_correct": 0.0,
+                            "reward/frac_zero_std": frac_reward_zero_std,
+                            **completion_log_data,
+                            "time/step_total": step_time,
+                            "time/generation": gen_time,
+                            "time/training": 0.0,
+                            "train/surrogate_loss": 0.0,
+                            "train/mean_ratio": 1.0,
+                            "train/clip_ratio": 0.0,
+                            "train/grad_norm": 0.0,
+                            "train/lr": scheduler.get_last_lr()[0],
                             "skipped": True,
                         }
                     )
                 continue
 
-        # --- 5b. Tokenize ---
+        # --- 5b. Pad into batched tensors ---
         max_length = config.max_model_len
-        tokenized = tokenize_prompt_response_pairs(tokenizer, flat_prompts, flat_responses, max_length)
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        tokenized = pad_token_id_pairs(flat_prompt_ids, flat_response_ids, max_length, pad_token_id=pad_id)
 
         # --- 6. GRPO update (μ iterations per generation batch) ---
         train_start = time.time()
@@ -538,20 +631,14 @@ def main(config: GRPOConfig) -> None:
         step_time = time.time() - step_start
 
         # --- 7. Logging ---
-        completion_lengths = [len(tokenizer.encode(r, add_special_tokens=False)) for r in all_responses]
-        mean_completion_len = sum(completion_lengths) / len(completion_lengths)
-        max_completion_len = max(completion_lengths)
-        min_completion_len = min(completion_lengths)
-
         log_data = {
             "step": step,
             "reward/mean": mean_reward,
             "reward/fraction_correct": fraction_correct,
+            "reward/kept_mean": kept_reward_mean,
+            "reward/kept_fraction_correct": kept_fraction_correct,
             "reward/frac_zero_std": frac_reward_zero_std,
-            "completions/mean_length": mean_completion_len,
-            "completions/max_length": max_completion_len,
-            "completions/min_length": min_completion_len,
-            "completions/clipped_ratio": clipped_ratio,
+            **completion_log_data,
             "time/step_total": step_time,
             "time/generation": gen_time,
             "time/training": train_time,
@@ -560,19 +647,24 @@ def main(config: GRPOConfig) -> None:
 
         if step % config.log_every == 0:
             kl_str = f" kl={metrics['kl']:.4f}" if "kl" in metrics else ""
+            kept_str = (
+                f" kept={kept_fraction_correct * 100:.1f}%" if completion_log_data["completions/clipped_ratio"] > 0 else ""
+            )
             logger.info(
-                "[Step %d/%d] reward=%.3f correct=%.1f%% len=%.0f surr=%.4f%s"
+                "[Step %d/%d] reward=%.3f correct=%.1f%%%s len=%.0f grad=%.4f surr=%.4f%s"
                 " ratio=%.3f clip=%.3f trunc=%.1f%% gen=%.1fs train=%.1fs",
                 step,
                 config.num_steps,
                 mean_reward,
                 fraction_correct * 100,
-                mean_completion_len,
+                kept_str,
+                completion_log_data["completions/mean_length"],
+                metrics.get("grad_norm", 0),
                 metrics.get("surrogate_loss", 0),
                 kl_str,
                 metrics.get("mean_ratio", 1),
                 metrics.get("clip_ratio", 0),
-                clipped_ratio * 100,
+                completion_log_data["completions/clipped_ratio"] * 100,
                 gen_time,
                 train_time,
             )
@@ -635,6 +727,7 @@ def parse_args() -> GRPOConfig:
     p.add_argument("--save-every", type=int)
     p.add_argument("--smoke-test", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--wandb", dest="wandb_enabled", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--seed", type=int)
     args = p.parse_args()
     return GRPOConfig(**{k: v for k, v in vars(args).items() if v is not None})
 

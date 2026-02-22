@@ -1,8 +1,8 @@
 """Interactive chat with ByteDance/Ouro-1.4B-Thinking via HuggingFace Transformers.
 
 Run with:
-    uv run python examples/chat_hf.py
-    uv run python examples/chat_hf.py --prompt "What is 2+2?"
+    uv run dev/chat_hf.py
+    uv run dev/chat_hf.py --prompt "What is 2+2?"
 """
 
 import argparse

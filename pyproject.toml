@@ -69,6 +69,10 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
 ]
+filterwarnings = [
+    "ignore::DeprecationWarning:importlib._bootstrap",  # SwigPyPacked/SwigPyObject from CUDA libs
+    "ignore:This process.*is multi-threaded.*use of fork:DeprecationWarning",  # vLLM worker spawning
+]
 
 [tool.uv.sources]
 flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }

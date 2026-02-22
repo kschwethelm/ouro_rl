@@ -1,8 +1,8 @@
 """Interactive chat with ByteDance/Ouro-1.4B-Thinking via vLLM.
 
 Run with the vLLM environment:
-    /home/kiki/tmp/ouro_vllm_test/.venv/bin/python examples/chat.py
-    /home/kiki/tmp/ouro_vllm_test/.venv/bin/python examples/chat.py --prompt "What is 2+2?"
+    uv run dev/chat.py
+    uv run dev/chat.py --prompt "What is 2+2?"
 """
 
 import argparse
@@ -18,8 +18,8 @@ CHAT_TEMPLATE = (Path(__file__).resolve().parent.parent / "templates" / "ouro_ch
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Chat with Ouro via vLLM")
     p.add_argument("--model", default="ByteDance/Ouro-1.4B-Thinking")
-    p.add_argument("--max-model-len", type=int, default=8192)
-    p.add_argument("--max-new-tokens", type=int, default=2048)
+    p.add_argument("--max-model-len", type=int, default=2048)
+    p.add_argument("--max-new-tokens", type=int, default=1700)
     p.add_argument("--system-prompt", default="You are a helpful assistant.")
     p.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--show-thinking", action=argparse.BooleanOptionalAction, default=True)
@@ -49,7 +49,11 @@ def generate(
     messages: list[dict[str, str]],
     *,
     enable_thinking: bool,
-) -> str:
+) -> tuple[str, str]:
+    """Generate a response and return (text, finish_reason).
+
+    finish_reason is "stop" (natural EOS) or "length" (hit max_tokens).
+    """
     prompt = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -58,14 +62,17 @@ def generate(
         enable_thinking=enable_thinking,
     )
     outputs = llm.generate([prompt], sampling_params)
-    return outputs[0].outputs[0].text
+    output = outputs[0].outputs[0]
+    return output.text, output.finish_reason
 
 
-def print_response(raw_response: str, *, show_thinking: bool) -> str:
+def print_response(raw_response: str, finish_reason: str, *, show_thinking: bool) -> str:
     thinking, answer = split_thinking(raw_response)
     if show_thinking and thinking:
         print(f"\n\033[2m[Thinking]\n{thinking}\033[0m\n")
     print(f"Ouro: {answer}\n")
+    if finish_reason != "stop":
+        print(f"\033[33m[Truncated: hit max_tokens (finish_reason={finish_reason!r})]\033[0m\n")
     return answer
 
 
@@ -94,8 +101,8 @@ def main() -> None:
             {"role": "system", "content": args.system_prompt},
             {"role": "user", "content": args.prompt},
         ]
-        raw = generate(llm, tokenizer, sampling_params, messages, enable_thinking=enable_thinking)
-        print_response(raw, show_thinking=show_thinking)
+        raw, finish_reason = generate(llm, tokenizer, sampling_params, messages, enable_thinking=enable_thinking)
+        print_response(raw, finish_reason, show_thinking=show_thinking)
         return
 
     print(f"\nReady. Chatting with {args.model}.")
@@ -123,8 +130,8 @@ def main() -> None:
         messages.append({"role": "user", "content": user_input})
         full_messages = [{"role": "system", "content": args.system_prompt}] + messages
 
-        raw_response = generate(llm, tokenizer, sampling_params, full_messages, enable_thinking=enable_thinking)
-        answer = print_response(raw_response, show_thinking=show_thinking)
+        raw_response, finish_reason = generate(llm, tokenizer, sampling_params, full_messages, enable_thinking=enable_thinking)
+        answer = print_response(raw_response, finish_reason, show_thinking=show_thinking)
 
         messages.append({"role": "assistant", "content": answer})
 

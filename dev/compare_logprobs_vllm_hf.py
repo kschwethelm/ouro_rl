@@ -82,13 +82,15 @@ def main() -> None:
             sampled_id = token_ids[pos]
             lp_values.append(lp_dict[sampled_id].logprob)
 
-        vllm_data.append({
-            "problem": PROBLEMS[i],
-            "prompt": prompts[i],
-            "response_token_ids": token_ids,
-            "response_text": completion.text,
-            "vllm_logprobs": lp_values,
-        })
+        vllm_data.append(
+            {
+                "problem": PROBLEMS[i],
+                "prompt": prompts[i],
+                "response_token_ids": token_ids,
+                "response_text": completion.text,
+                "vllm_logprobs": lp_values,
+            }
+        )
         print(f"\n[{i}] {PROBLEMS[i]}")
         print(f"    Generated {len(token_ids)} tokens")
         print(f"    Response: {completion.text[:100]}...")
@@ -169,11 +171,13 @@ def main() -> None:
 
         # Show worst-case tokens.
         worst_idx = abs_diffs.index(max(abs_diffs))
-        print(f"    Worst token:  pos={worst_idx}, "
-              f"vLLM={vllm_lp[worst_idx]:.6f}, "
-              f"HF={hf_lp[worst_idx]:.6f}, "
-              f"diff={diffs[worst_idx]:.6f}, "
-              f"ratio={ratios[worst_idx]:.6f}")
+        print(
+            f"    Worst token:  pos={worst_idx}, "
+            f"vLLM={vllm_lp[worst_idx]:.6f}, "
+            f"HF={hf_lp[worst_idx]:.6f}, "
+            f"diff={diffs[worst_idx]:.6f}, "
+            f"ratio={ratios[worst_idx]:.6f}"
+        )
 
     # --- Summary ---
     print("\n" + "=" * 70)
@@ -193,24 +197,29 @@ def main() -> None:
     if overall_ratio_range[0] > 0.99 and overall_ratio_range[1] < 1.01:
         print("\n-> Mismatch is NEGLIGIBLE. vLLM log-probs are safe to use as old_log_probs.")
     elif overall_ratio_range[0] > 0.95 and overall_ratio_range[1] < 1.05:
-        print("\n-> Mismatch is SMALL but non-trivial. Likely safe with clip_eps=0.2, "
-              "but monitor mean_ratio during training.")
+        print("\n-> Mismatch is SMALL but non-trivial. Likely safe with clip_eps=0.2, but monitor mean_ratio during training.")
     else:
-        print("\n-> Mismatch is SIGNIFICANT. Using vLLM log-probs as old_log_probs "
-              "would cause spurious clipping. Keep HF forward pass.")
+        print(
+            "\n-> Mismatch is SIGNIFICANT. Using vLLM log-probs as old_log_probs "
+            "would cause spurious clipping. Keep HF forward pass."
+        )
 
     if args.output:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w") as f:
-            json.dump({
-                "model": args.model,
-                "temperature": args.temperature,
-                "max_new_tokens": args.max_new_tokens,
-                "results": results,
-                "overall_max_log_diff": overall_max_diff,
-                "overall_ratio_range": list(overall_ratio_range),
-            }, f, indent=2)
+            json.dump(
+                {
+                    "model": args.model,
+                    "temperature": args.temperature,
+                    "max_new_tokens": args.max_new_tokens,
+                    "results": results,
+                    "overall_max_log_diff": overall_max_diff,
+                    "overall_ratio_range": list(overall_ratio_range),
+                },
+                f,
+                indent=2,
+            )
         print(f"\nResults saved to {output_path}")
 
 
