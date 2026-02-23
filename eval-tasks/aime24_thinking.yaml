@@ -1,6 +1,6 @@
 # AIME 2024 for thinking models (zero-shot, \boxed{} answer format).
 # Use with: --apply_chat_template --system_instruction "..." --include_path eval-tasks
-include: _thinking_base.yaml
+include: _math_base.yaml
 task: aime24_thinking
 dataset_path: Maxwell-Jia/AIME_2024
 dataset_name: null

@@ -1,6 +1,6 @@
 # GSM8K for thinking models (zero-shot, \boxed{} answer format).
 # Use with: --apply_chat_template --system_instruction "..." --include_path eval-tasks
-include: _thinking_base.yaml
+include: _math_base.yaml
 task: gsm8k_thinking
 dataset_path: openai/gsm8k
 dataset_name: main
