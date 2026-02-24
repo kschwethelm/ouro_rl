@@ -1,6 +1,8 @@
-"""GRPO loss computation: advantages, log-probs, clipped surrogate + KL.
+"""GRPO / CISPO loss computation: advantages, log-probs, surrogate objectives + KL.
 
-Reference: DeepSeekMath (arXiv:2402.03300) Group Relative Policy Optimization.
+References:
+    GRPO: DeepSeekMath (arXiv:2402.03300) — clipped surrogate.
+    CISPO: ScaleRL (arXiv:2510.13786) / MiniMax-M1 — truncated IS policy gradient.
 """
 
 import torch
@@ -189,6 +191,88 @@ def grpo_loss(
     metrics["clip_ratio"] = is_clipped.sum().float().item() / total_response_tokens.item()
 
     # Optional KL penalty (policy vs reference).
+    if kl_coeff > 0:
+        assert ref_log_probs is not None, "ref_log_probs required when kl_coeff > 0"
+        token_kl = policy_log_probs - ref_log_probs
+        if token_level_loss:
+            kl = (token_kl * response_mask).sum() / total_response_tokens
+        else:
+            response_lengths = response_mask.sum(dim=1).clamp(min=1)
+            kl = ((token_kl * response_mask).sum(dim=1) / response_lengths).mean()
+        loss = loss + kl_coeff * kl
+        metrics["kl"] = kl.item()
+
+    return loss, metrics
+
+
+def cispo_loss(
+    policy_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor | None,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    truncation_max: float = 5.0,
+    kl_coeff: float = 0.0,
+    ref_log_probs: torch.Tensor | None = None,
+    token_level_loss: bool = True,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute CISPO loss: truncated IS-weighted vanilla policy gradient.
+
+    Key difference from GRPO: gradient flows ONLY through log_pi (the IS ratio
+    is stop-gradiented). Uses one-sided truncation (cap at truncation_max)
+    instead of symmetric clipping.
+
+    Loss = -sg(min(ρ, truncation_max)) * advantage * log_π(y|x)
+
+    When old_log_probs is None (num_iterations == 1), the IS ratio is 1.0
+    everywhere, so CISPO reduces to vanilla REINFORCE — identical to GRPO.
+
+    Args:
+        policy_log_probs: (batch, seq_len) per-token log-probs with grad.
+        old_log_probs: (batch, seq_len) frozen snapshot, or None for num_iterations=1.
+        advantages: (batch,) per-sequence advantage.
+        response_mask: (batch, seq_len) 1.0 for response tokens.
+        truncation_max: IS ratio cap (default 5.0). Insensitive to choice in {4, 5, 8}.
+        kl_coeff: KL penalty coefficient (0.0 to disable).
+        ref_log_probs: (batch, seq_len) reference model log-probs (required if kl_coeff > 0).
+        token_level_loss: If True, flat average over all response tokens.
+
+    Returns:
+        loss: scalar to minimize.
+        metrics: dict with surrogate_loss, mean_ratio, truncation_ratio, and optionally kl.
+    """
+    adv = advantages.unsqueeze(1)  # (batch,) → (batch, 1)
+
+    # IS ratio (fully stop-gradiented).
+    if old_log_probs is not None:  # noqa: SIM108
+        log_ratio = policy_log_probs.detach() - old_log_probs
+    else:
+        # num_iterations=1: ratio is 1.0 everywhere.
+        log_ratio = torch.zeros_like(policy_log_probs)
+
+    ratio = torch.exp(log_ratio.clamp(-10, 10))
+    truncated_ratio = torch.clamp(ratio, max=truncation_max).detach()
+
+    # CISPO objective: sg(min(ρ, ε_max)) * advantage * log_π
+    token_objective = truncated_ratio * adv * policy_log_probs
+
+    total_response_tokens = response_mask.sum().clamp(min=1)
+
+    if token_level_loss:
+        surrogate_loss = -(token_objective * response_mask).sum() / total_response_tokens
+    else:
+        response_lengths = response_mask.sum(dim=1).clamp(min=1)
+        seq_objective = (token_objective * response_mask).sum(dim=1) / response_lengths
+        surrogate_loss = -seq_objective.mean()
+
+    loss = surrogate_loss
+
+    metrics: dict[str, float] = {"surrogate_loss": surrogate_loss.item()}
+
+    is_truncated = (ratio > truncation_max) & response_mask.bool()
+    metrics["mean_ratio"] = ratio[response_mask.bool()].mean().item() if response_mask.any() else 1.0
+    metrics["truncation_ratio"] = is_truncated.sum().float().item() / total_response_tokens.item()
+
+    # Optional KL penalty (same as GRPO).
     if kl_coeff > 0:
         assert ref_log_probs is not None, "ref_log_probs required when kl_coeff > 0"
         token_kl = policy_log_probs - ref_log_probs

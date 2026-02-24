@@ -5,7 +5,7 @@ Research code — simple, correct, and efficient:
 - Simple, hackable implementations > frameworks
 - Correctness is non-negotiable — write pytest tests for non-trivial functions
 - Tests should cover behavior and edge cases, not implementation details — keep them maintainable so refactors don't require rewriting every test
-- Compute is scarce — always consider memory, FLOPs, and throughput implications
+- Compute is scarce (2×A100-SXM4-80GB) — always consider memory, FLOPs, and throughput implications
 
 ## Code Standards
 - Before writing new functions, check existing modules for code that can be extended or reused

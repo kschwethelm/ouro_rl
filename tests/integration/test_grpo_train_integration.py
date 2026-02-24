@@ -9,9 +9,17 @@ import torch
 from transformers import AutoTokenizer
 from vllm import SamplingParams
 
-from ouro_rl.data import CHAT_TEMPLATE, format_prompt
+from ouro_rl.data import CHAT_TEMPLATE, INTERRUPTION_PHRASE, format_prompt
 from ouro_rl.patches import CORRECT_BOS_TOKEN_ID, CORRECT_EOS_TOKEN_ID, PAD_TOKEN_ID, patch_ouro
-from scripts.grpo_train import generate_rollouts, pad_token_id_pairs
+from scripts.grpo_train import (
+    create_vllm,
+    destroy_vllm,
+    find_truncated_completions,
+    generate_rollouts,
+    generate_with_vllm,
+    pad_token_id_pairs,
+    stitch_interruptions,
+)
 
 MODEL_NAME = "ByteDance/Ouro-1.4B-Thinking"
 MAX_MODEL_LEN = 512
@@ -131,3 +139,147 @@ class TestPadAndRecoverIntegration:
             expected = flat_prompt_ids[seq_idx] + flat_response_ids[seq_idx]
             # May be truncated if over max_length, so compare up to actual length.
             assert actual_ids == expected[: len(actual_ids)]
+
+
+# ---------------------------------------------------------------------------
+# Two-phase interruption flow
+# ---------------------------------------------------------------------------
+
+THINKING_BUDGET = 16  # Tiny budget to force truncation.
+ANSWER_BUDGET = 32
+
+
+@requires_cuda
+@pytest.mark.integration
+class TestInterruptionFlowIntegration:
+    """End-to-end test of the two-phase interruption pipeline with real vLLM."""
+
+    def test_two_phase_generation(self, tokenizer):
+        """Phase 1 (tiny budget) → detect truncated → Phase 2 → stitch.
+
+        With a 16-token thinking budget, the model won't produce </think> or EOS,
+        so all completions should be identified as truncated and interrupted.
+        """
+        prompts = ["What is 2 + 2?", "Solve x + 1 = 3."]
+        formatted = [format_prompt(p, tokenizer, enable_thinking=True) for p in prompts]
+        prompt_token_ids = [tokenizer.encode(p) for p in formatted]
+
+        think_close_id = tokenizer.convert_tokens_to_ids("</think>")
+        interruption_token_ids = tokenizer.encode(INTERRUPTION_PHRASE, add_special_tokens=False)
+
+        n_prompts = len(prompts)
+        n_rollouts = 2
+
+        # Phase 1: generate with tiny thinking budget.
+        phase1_params = SamplingParams(
+            n=n_rollouts,
+            temperature=0.7,
+            max_tokens=THINKING_BUDGET,
+            stop_token_ids=[CORRECT_EOS_TOKEN_ID],
+            skip_special_tokens=False,
+        )
+
+        llm = create_vllm(MODEL_NAME, max_model_len=MAX_MODEL_LEN)
+        rollout_response_ids = generate_with_vllm(llm, prompt_token_ids, phase1_params)
+
+        # Verify structure.
+        assert len(rollout_response_ids) == n_prompts
+        for prompt_rollouts in rollout_response_ids:
+            assert len(prompt_rollouts) == n_rollouts
+            for resp_ids in prompt_rollouts:
+                assert len(resp_ids) > 0
+                assert len(resp_ids) <= THINKING_BUDGET
+
+        # Detect truncated completions.
+        needs_interruption = find_truncated_completions(rollout_response_ids, CORRECT_EOS_TOKEN_ID, think_close_id)
+        # With 16-token budget, expect most/all to be truncated.
+        assert len(needs_interruption) > 0, "Expected at least some truncated completions with tiny budget"
+
+        # Save originals for comparison.
+        original_thinking = {(pi, ri): list(rollout_response_ids[pi][ri]) for pi, ri in needs_interruption}
+
+        # Phase 2: generate answers for truncated completions.
+        phase2_prompt_ids = [
+            prompt_token_ids[pi] + rollout_response_ids[pi][ri] + interruption_token_ids for pi, ri in needs_interruption
+        ]
+        phase2_params = SamplingParams(
+            n=1,
+            temperature=0.7,
+            max_tokens=ANSWER_BUDGET,
+            stop_token_ids=[CORRECT_EOS_TOKEN_ID],
+            skip_special_tokens=False,
+        )
+        phase2_responses = generate_with_vllm(llm, phase2_prompt_ids, phase2_params)
+        destroy_vllm(llm)
+
+        # Verify phase 2 structure.
+        assert len(phase2_responses) == len(needs_interruption)
+        for answer_rollouts in phase2_responses:
+            assert len(answer_rollouts) == 1  # n=1
+            assert len(answer_rollouts[0]) > 0
+
+        # Stitch and verify.
+        stitch_interruptions(rollout_response_ids, needs_interruption, interruption_token_ids, phase2_responses)
+
+        for idx, (pi, ri) in enumerate(needs_interruption):
+            stitched = rollout_response_ids[pi][ri]
+            thinking = original_thinking[(pi, ri)]
+            answer = phase2_responses[idx][0]
+
+            # Stitched = thinking + interruption + answer.
+            assert stitched[: len(thinking)] == thinking, "Thinking prefix must be preserved"
+            assert stitched[len(thinking) : len(thinking) + len(interruption_token_ids)] == interruption_token_ids, (
+                "Interruption phrase must follow thinking"
+            )
+            assert stitched[len(thinking) + len(interruption_token_ids) :] == answer, "Answer must follow interruption phrase"
+
+            # Decode and verify the interruption text is present.
+            decoded = tokenizer.decode(stitched)
+            assert "time is up" in decoded.lower(), f"Decoded text should contain interruption phrase: {decoded[:200]}"
+
+    def test_interrupted_completions_are_decodable(self, tokenizer):
+        """Stitched responses decode to valid text containing thinking + interruption + answer."""
+        prompt = "What is 7 * 8?"
+        formatted = format_prompt(prompt, tokenizer, enable_thinking=True)
+        prompt_token_ids = [tokenizer.encode(formatted)]
+
+        think_close_id = tokenizer.convert_tokens_to_ids("</think>")
+        interruption_token_ids = tokenizer.encode(INTERRUPTION_PHRASE, add_special_tokens=False)
+
+        phase1_params = SamplingParams(
+            n=1,
+            temperature=0.7,
+            max_tokens=THINKING_BUDGET,
+            stop_token_ids=[CORRECT_EOS_TOKEN_ID],
+            skip_special_tokens=False,
+        )
+
+        llm = create_vllm(MODEL_NAME, max_model_len=MAX_MODEL_LEN)
+        rollout_response_ids = generate_with_vllm(llm, prompt_token_ids, phase1_params)
+
+        needs = find_truncated_completions(rollout_response_ids, CORRECT_EOS_TOKEN_ID, think_close_id)
+
+        if needs:
+            phase2_prompt_ids = [
+                prompt_token_ids[pi] + rollout_response_ids[pi][ri] + interruption_token_ids for pi, ri in needs
+            ]
+            phase2_params = SamplingParams(
+                n=1,
+                temperature=0.7,
+                max_tokens=ANSWER_BUDGET,
+                stop_token_ids=[CORRECT_EOS_TOKEN_ID],
+                skip_special_tokens=False,
+            )
+            phase2_responses = generate_with_vllm(llm, phase2_prompt_ids, phase2_params)
+            stitch_interruptions(rollout_response_ids, needs, interruption_token_ids, phase2_responses)
+
+        destroy_vllm(llm)
+
+        # Every response should decode cleanly.
+        for prompt_rollouts in rollout_response_ids:
+            for resp_ids in prompt_rollouts:
+                decoded = tokenizer.decode(resp_ids)
+                assert len(decoded) > 0, "Decoded response should not be empty"
+                # If it was interrupted, it should contain </think> from the interruption phrase.
+                if needs:
+                    assert "</think>" in decoded, f"Interrupted response should contain </think>: {decoded[:200]}"

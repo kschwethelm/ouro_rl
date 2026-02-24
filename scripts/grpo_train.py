@@ -27,8 +27,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 
-from ouro_rl.data import CHAT_TEMPLATE, format_prompt, load_math_train
-from ouro_rl.grpo import compute_advantages, compute_log_probs_batch, compute_log_probs_with_grad, grpo_loss
+from ouro_rl.data import CHAT_TEMPLATE, INTERRUPTION_PHRASE, format_prompt, load_math_train
+from ouro_rl.grpo import cispo_loss, compute_advantages, compute_log_probs_batch, compute_log_probs_with_grad, grpo_loss
 from ouro_rl.patches import CORRECT_EOS_TOKEN_ID, patch_ouro, patch_ouro_post_load
 from ouro_rl.reward import score_answer
 
@@ -62,19 +62,27 @@ class GRPOConfig:
     warmup_steps: int = 0
     weight_decay: float = 0.01
 
-    # GRPO
-    clip_eps: float = 0.2
+    # Loss
+    loss_type: str = "cispo"  # "grpo" (clipped surrogate) or "cispo" (truncated IS policy gradient)
+    clip_eps: float = 0.2  # GRPO: symmetric clip range [1-eps, 1+eps]
+    truncation_max: float = 5.0  # CISPO: IS ratio cap (insensitive to choice in {4, 5, 8})
     kl_coeff: float = 0.0  # KL not needed with verifiable rewards (DAPO, Open-Reasoner-Zero)
     scale_rewards: str = "batch"  # "batch" (group mean, batch std), "group" (per-group std), "none" (no std)
-    num_iterations: int = 1  # μ: number of policy updates per generation batch
+    num_iterations: int = 2  # μ: number of policy updates per generation batch (ScaleRL uses μ=2)
     mask_truncated_completions: bool = False  # Include truncated completions (reward=0 → negative advantage teaches brevity)
     token_level_loss: bool = True  # Token-level average (avoids length bias) vs per-sequence average
 
     # Generation
-    max_new_tokens: int = 4096
+    max_new_tokens: int = 4608
     temperature: float = 1.0
     top_p: float = 0.7
     enable_thinking: bool = True
+
+    # Interruptions (ScaleRL: force truncated completions to produce an answer)
+    enable_interruptions: bool = True
+    thinking_budget_min: int = 3072  # min thinking tokens before interruption
+    thinking_budget_max: int = 4096  # max thinking tokens (randomized per step)
+    answer_budget: int = 512  # max tokens for answer after interruption
 
     # Memory
     log_prob_micro_batch: int = 4  # micro-batch for log-prob forward passes
@@ -102,6 +110,10 @@ class GRPOConfig:
             self.save_every = 1
             self.max_new_tokens = 256
             self.max_model_len = 1024
+            if self.enable_interruptions:
+                self.thinking_budget_min = 128
+                self.thinking_budget_max = 192
+                self.answer_budget = 64
 
     # Derived
     @property
@@ -114,6 +126,95 @@ class GRPOConfig:
 # ---------------------------------------------------------------------------
 
 
+def create_vllm(
+    model_path: str,
+    *,
+    dtype: str = "bfloat16",
+    max_model_len: int = 4096,
+    trust_remote_code: bool = True,
+) -> LLM:
+    """Create a vLLM LLM instance for generation."""
+    return LLM(
+        model=model_path,
+        trust_remote_code=trust_remote_code,
+        dtype=dtype,
+        max_model_len=max_model_len,
+        enforce_eager=True,  # Simpler, avoids CUDA graph issues with model swapping.
+        skip_tokenizer_init=True,
+    )
+
+
+def destroy_vllm(llm: LLM) -> None:
+    """Destroy a vLLM LLM instance and free GPU memory."""
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def generate_with_vllm(
+    llm: LLM,
+    prompt_token_ids: list[list[int]],
+    sampling_params: SamplingParams,
+) -> list[list[list[int]]]:
+    """Generate rollouts using an existing vLLM instance.
+
+    Accepts pre-tokenized prompt_token_ids (vLLM was created with
+    skip_tokenizer_init=True). Number of rollouts per prompt is controlled
+    by sampling_params.n.
+
+    Returns:
+        response_token_ids: [prompt_idx][rollout_idx] list of token ID lists.
+    """
+    outputs = llm.generate(
+        [{"prompt_token_ids": ids} for ids in prompt_token_ids],
+        sampling_params,
+    )
+    return [[list(out.token_ids) for out in output.outputs] for output in outputs]
+
+
+def find_truncated_completions(
+    rollout_response_ids: list[list[list[int]]],
+    eos_token_id: int,
+    think_close_id: int,
+) -> list[tuple[int, int]]:
+    """Identify completions that were truncated mid-thinking.
+
+    A completion is truncated if it has neither EOS nor </think>.
+    These need an interruption phrase + second generation to produce an answer.
+
+    Returns:
+        List of (prompt_idx, rollout_idx) tuples for truncated completions.
+    """
+    needs_interruption: list[tuple[int, int]] = []
+    for i, prompt_rollouts in enumerate(rollout_response_ids):
+        for j, resp_ids in enumerate(prompt_rollouts):
+            has_eos = resp_ids and resp_ids[-1] == eos_token_id
+            has_think_close = think_close_id in resp_ids
+            if not has_eos and not has_think_close:
+                needs_interruption.append((i, j))
+    return needs_interruption
+
+
+def stitch_interruptions(
+    rollout_response_ids: list[list[list[int]]],
+    needs_interruption: list[tuple[int, int]],
+    interruption_token_ids: list[int],
+    phase2_responses: list[list[list[int]]],
+) -> None:
+    """Stitch interrupted completions: thinking + interruption phrase + answer.
+
+    Modifies rollout_response_ids in-place.
+
+    Args:
+        rollout_response_ids: [prompt_idx][rollout_idx] → token ID list.
+        needs_interruption: (prompt_idx, rollout_idx) pairs from find_truncated_completions.
+        interruption_token_ids: Tokenized INTERRUPTION_PHRASE.
+        phase2_responses: [idx][0] → answer token IDs (n=1 per interrupted completion).
+    """
+    for idx, (pi, ri) in enumerate(needs_interruption):
+        rollout_response_ids[pi][ri] = rollout_response_ids[pi][ri] + interruption_token_ids + phase2_responses[idx][0]
+
+
 def generate_rollouts(
     model_path: str,
     prompt_token_ids: list[list[int]],
@@ -123,41 +224,16 @@ def generate_rollouts(
     max_model_len: int = 4096,
     trust_remote_code: bool = True,
 ) -> list[list[list[int]]]:
-    """Generate multiple rollouts per prompt using vLLM.
+    """Generate rollouts, managing the vLLM lifecycle internally.
 
-    Creates a vLLM LLM instance, generates, then destroys it to free GPU memory.
-    Number of rollouts per prompt is controlled by sampling_params.n.
-
-    Accepts pre-tokenized prompt_token_ids and skips vLLM's tokenizer entirely
-    (skip_tokenizer_init=True). The caller controls tokenization (correct
-    bos/eos/pad) and must decode response token IDs externally.
-
-    Whether a response completed naturally (vs hitting max_tokens) can be
-    determined by checking if the last token is EOS — the stop token is
-    included in token_ids when skip_special_tokens=False.
-
-    Returns:
-        response_token_ids: [prompt_idx][rollout_idx] list of token ID lists.
+    Convenience wrapper: creates a vLLM instance, generates, then destroys it
+    to free GPU memory. Use create_vllm/generate_with_vllm/destroy_vllm directly
+    when multiple generation calls share the same instance (e.g. interruptions).
     """
-    llm = LLM(
-        model=model_path,
-        trust_remote_code=trust_remote_code,
-        dtype=dtype,
-        max_model_len=max_model_len,
-        enforce_eager=True,  # Simpler, avoids CUDA graph issues with model swapping.
-        skip_tokenizer_init=True,
-    )
-    outputs = llm.generate(
-        [{"prompt_token_ids": ids} for ids in prompt_token_ids],
-        sampling_params,
-    )
-
-    # Clean up vLLM completely.
-    del llm
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    return [[list(out.token_ids) for out in output.outputs] for output in outputs]
+    llm = create_vllm(model_path, dtype=dtype, max_model_len=max_model_len, trust_remote_code=trust_remote_code)
+    result = generate_with_vllm(llm, prompt_token_ids, sampling_params)
+    destroy_vllm(llm)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -292,16 +368,19 @@ def train_step(
             response_start_indices[mb_slice],
         )
 
-        loss, metrics = grpo_loss(
-            policy_log_probs=policy_lp,
-            old_log_probs=old_log_probs[mb_slice] if old_log_probs is not None else None,
-            advantages=advantages[mb_slice],
-            response_mask=response_mask[mb_slice],
-            clip_eps=config.clip_eps,
-            kl_coeff=config.kl_coeff,
-            ref_log_probs=ref_log_probs[mb_slice] if ref_log_probs is not None else None,
-            token_level_loss=config.token_level_loss,
-        )
+        loss_kwargs = {
+            "policy_log_probs": policy_lp,
+            "old_log_probs": old_log_probs[mb_slice] if old_log_probs is not None else None,
+            "advantages": advantages[mb_slice],
+            "response_mask": response_mask[mb_slice],
+            "kl_coeff": config.kl_coeff,
+            "ref_log_probs": ref_log_probs[mb_slice] if ref_log_probs is not None else None,
+            "token_level_loss": config.token_level_loss,
+        }
+        if config.loss_type == "cispo":
+            loss, metrics = cispo_loss(**loss_kwargs, truncation_max=config.truncation_max)
+        else:
+            loss, metrics = grpo_loss(**loss_kwargs, clip_eps=config.clip_eps)
 
         # Scale loss by number of micro-batches for correct gradient averaging.
         scaled_loss = loss / num_micro_batches
@@ -457,13 +536,66 @@ def main(config: GRPOConfig) -> None:
         torch.cuda.empty_cache()
 
         gen_start = time.time()
-        rollout_response_ids = generate_rollouts(
-            current_model_path,
-            prompt_token_ids,
-            sampling_params,
-            dtype=config.dtype,
-            max_model_len=config.max_model_len,
-        )
+        n_interrupted = 0
+
+        if config.enable_interruptions:
+            # Two-phase generation: thinking → interruption → answer.
+            thinking_budget = random.randint(config.thinking_budget_min, config.thinking_budget_max)
+            phase1_params = SamplingParams(
+                n=config.rollouts_per_prompt,
+                temperature=config.temperature,
+                top_p=config.top_p,
+                max_tokens=thinking_budget,
+                stop_token_ids=[CORRECT_EOS_TOKEN_ID],
+                skip_special_tokens=False,
+            )
+
+            llm = create_vllm(current_model_path, dtype=config.dtype, max_model_len=config.max_model_len)
+            rollout_response_ids = generate_with_vllm(llm, prompt_token_ids, phase1_params)
+
+            # Identify truncated completions (no EOS and no </think> → thinking was cut off).
+            think_close_id = tokenizer.convert_tokens_to_ids("</think>")
+            interruption_token_ids = tokenizer.encode(INTERRUPTION_PHRASE, add_special_tokens=False)
+
+            needs_interruption = find_truncated_completions(rollout_response_ids, CORRECT_EOS_TOKEN_ID, think_close_id)
+            n_interrupted = len(needs_interruption)
+
+            if n_interrupted > 0:
+                # Build phase 2 prompts: original prompt + thinking + interruption phrase.
+                phase2_prompt_ids = [
+                    prompt_token_ids[pi] + rollout_response_ids[pi][ri] + interruption_token_ids
+                    for pi, ri in needs_interruption
+                ]
+
+                phase2_params = SamplingParams(
+                    n=1,
+                    temperature=config.temperature,
+                    top_p=config.top_p,
+                    max_tokens=config.answer_budget,
+                    stop_token_ids=[CORRECT_EOS_TOKEN_ID],
+                    skip_special_tokens=False,
+                )
+                phase2_responses = generate_with_vllm(llm, phase2_prompt_ids, phase2_params)
+
+                stitch_interruptions(rollout_response_ids, needs_interruption, interruption_token_ids, phase2_responses)
+
+            destroy_vllm(llm)
+            logger.info(
+                "[Step %d/%d] Generation complete: %d/%d interrupted",
+                step,
+                config.num_steps,
+                n_interrupted,
+                config.total_rollouts_per_step,
+            )
+        else:
+            rollout_response_ids = generate_rollouts(
+                current_model_path,
+                prompt_token_ids,
+                sampling_params,
+                dtype=config.dtype,
+                max_model_len=config.max_model_len,
+            )
+
         gen_time = time.time() - gen_start
 
         # Decode response token IDs to text (vLLM skips tokenizer, so we do it here).
@@ -480,12 +612,15 @@ def main(config: GRPOConfig) -> None:
             for ids in prompt_rollouts
             if not ids or ids[-1] != CORRECT_EOS_TOKEN_ID
         ) / len(all_response_lengths)
-        completion_log_data = {
+        completion_log_data: dict[str, float] = {
             "completions/mean_length": mean_completion_len,
             "completions/max_length": max_completion_len,
             "completions/min_length": min_completion_len,
             "completions/clipped_ratio": clipped_ratio,
         }
+        if config.enable_interruptions:
+            completion_log_data["completions/interrupted_ratio"] = n_interrupted / len(all_response_lengths)
+            completion_log_data["completions/thinking_budget"] = thinking_budget
 
         # Move training models + optimizer state back to GPU.
         device = torch.device("cuda")
@@ -663,7 +798,7 @@ def main(config: GRPOConfig) -> None:
                 metrics.get("surrogate_loss", 0),
                 kl_str,
                 metrics.get("mean_ratio", 1),
-                metrics.get("clip_ratio", 0),
+                metrics.get("clip_ratio", metrics.get("truncation_ratio", 0)),
                 completion_log_data["completions/clipped_ratio"] * 100,
                 gen_time,
                 train_time,
@@ -720,9 +855,16 @@ def parse_args() -> GRPOConfig:
     p.add_argument("--scale-rewards", choices=["batch", "group", "none"])
     p.add_argument("--num-iterations", type=int)
     p.add_argument("--mask-truncated", dest="mask_truncated_completions", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--loss-type", choices=["grpo", "cispo"])
+    p.add_argument("--clip-eps", type=float)
+    p.add_argument("--truncation-max", type=float)
     p.add_argument("--max-new-tokens", type=int)
     p.add_argument("--max-model-len", type=int)
     p.add_argument("--temperature", type=float)
+    p.add_argument("--enable-interruptions", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--thinking-budget-min", type=int)
+    p.add_argument("--thinking-budget-max", type=int)
+    p.add_argument("--answer-budget", type=int)
     p.add_argument("--output-dir")
     p.add_argument("--save-every", type=int)
     p.add_argument("--smoke-test", action=argparse.BooleanOptionalAction, default=None)

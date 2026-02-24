@@ -21,6 +21,11 @@ CHAT_TEMPLATE = (Path(__file__).resolve().parent.parent / "templates" / "ouro_ch
 #   "<think> </think> tags, and the final answer should be given within \\boxed{}."
 MATH_SYSTEM_PROMPT: str | None = None
 
+# Interruption phrase for truncated completions (ScaleRL, arXiv:2510.13786).
+# When a completion hits the thinking budget without producing </think>,
+# this phrase is appended to force the model to produce a final answer.
+INTERRUPTION_PHRASE = "Okay, time is up. Let me stop thinking and formulate a final answer now.\n</think>\n"
+
 
 def load_math_train(dataset_name: str = "qwedsacf/competition_math") -> Dataset:
     """Load MATH training split.

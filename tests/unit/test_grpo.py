@@ -1,8 +1,8 @@
-"""Unit tests for ouro_rl/grpo.py — advantages, log-probs, and GRPO loss."""
+"""Unit tests for ouro_rl/grpo.py — advantages, log-probs, GRPO loss, and CISPO loss."""
 
 import torch
 
-from ouro_rl.grpo import compute_advantages, compute_log_probs_with_grad, grpo_loss
+from ouro_rl.grpo import cispo_loss, compute_advantages, compute_log_probs_with_grad, grpo_loss
 
 # ---------------------------------------------------------------------------
 # compute_advantages
@@ -284,4 +284,127 @@ class TestGRPOLoss:
         assert torch.allclose(policy_lp_1.grad, policy_lp_2.grad, atol=1e-6), (
             f"Vanilla PG gradient should match explicit old=policy gradient.\n"
             f"Max diff: {(policy_lp_1.grad - policy_lp_2.grad).abs().max().item()}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# cispo_loss
+# ---------------------------------------------------------------------------
+
+
+class TestCISPOLoss:
+    """Tests for the CISPO (truncated IS-weighted policy gradient) loss."""
+
+    def test_no_old_log_probs_reduces_to_reinforce(self):
+        """When old_log_probs=None, ratio=1.0 everywhere → vanilla REINFORCE."""
+        policy_lp = torch.randn(4, 10, requires_grad=True) * 0.1
+        adv = torch.randn(4)
+        mask = torch.zeros(4, 10)
+        mask[:, 3:] = 1.0
+
+        loss, metrics = cispo_loss(policy_lp, None, adv, mask)
+        assert loss.dim() == 0
+        assert abs(metrics["mean_ratio"] - 1.0) < 1e-5
+        assert metrics["truncation_ratio"] == 0.0
+
+    def test_gradient_flows_only_through_log_pi(self):
+        """Gradient must flow through log_pi and be nonzero."""
+        torch.manual_seed(42)
+        policy_lp = torch.randn(4, 10, requires_grad=True)
+        old_lp = policy_lp.detach().clone() + torch.randn(4, 10) * 0.3
+        adv = torch.tensor([1.0, -1.0, 0.5, -0.5])
+        mask = torch.ones(4, 10)
+
+        loss, _ = cispo_loss(policy_lp, old_lp, adv, mask)
+        loss.backward()
+
+        assert policy_lp.grad is not None
+        assert policy_lp.grad.abs().sum().item() > 0
+
+    def test_stop_gradient_on_ratio(self):
+        """old_lp=policy.detach() (ratio=1.0) must produce same gradient as old_lp=None."""
+        torch.manual_seed(42)
+        policy_lp_1 = torch.randn(4, 10, requires_grad=True)
+        policy_lp_2 = policy_lp_1.detach().clone().requires_grad_(True)
+        adv = torch.tensor([1.0, -1.0, 0.5, -0.5])
+        mask = torch.ones(4, 10)
+
+        # Path 1: old_lp = None (explicit REINFORCE)
+        loss1, _ = cispo_loss(policy_lp_1, None, adv, mask)
+        loss1.backward()
+
+        # Path 2: old_lp = detached policy (ratio=1.0, should match)
+        old_lp = policy_lp_2.detach().clone()
+        loss2, _ = cispo_loss(policy_lp_2, old_lp, adv, mask)
+        loss2.backward()
+
+        assert torch.allclose(policy_lp_1.grad, policy_lp_2.grad, atol=1e-6)
+
+    def test_truncation_triggers_on_large_ratio(self):
+        """Large policy/old divergence → some ratios get truncated."""
+        policy_lp = torch.zeros(2, 10)
+        old_lp = torch.full((2, 10), -5.0)  # large gap → ratio >> 1
+        adv = torch.tensor([1.0, -1.0])
+        mask = torch.ones(2, 10)
+
+        _, metrics = cispo_loss(policy_lp, old_lp, adv, mask, truncation_max=5.0)
+        assert metrics["truncation_ratio"] > 0, "Expected some truncation with large ratio"
+
+    def test_zero_advantages_zero_loss(self):
+        """If all advantages are zero, surrogate loss is zero."""
+        policy_lp = torch.randn(4, 10) * 0.1
+        old_lp = policy_lp.detach().clone()
+        adv = torch.zeros(4)
+        mask = torch.ones(4, 10)
+
+        loss, _ = cispo_loss(policy_lp, old_lp, adv, mask)
+        assert abs(loss.item()) < 1e-6
+
+    def test_token_level_vs_sequence_level(self):
+        """Both token_level_loss modes execute without error."""
+        policy_lp = torch.randn(4, 10) * 0.1
+        old_lp = policy_lp.detach().clone() + torch.randn(4, 10) * 0.02
+        adv = torch.tensor([1.0, -1.0, 0.5, -0.5])
+        mask = torch.zeros(4, 10)
+        mask[0, 2:] = 1.0
+        mask[1, 5:] = 1.0
+        mask[2, 3:] = 1.0
+        mask[3, 8:] = 1.0
+
+        loss_tok, _ = cispo_loss(policy_lp, old_lp, adv, mask, token_level_loss=True)
+        loss_seq, _ = cispo_loss(policy_lp, old_lp, adv, mask, token_level_loss=False)
+
+        assert loss_tok.dim() == 0
+        assert loss_seq.dim() == 0
+
+    def test_kl_penalty_added(self):
+        """With kl_coeff > 0, KL term appears in metrics."""
+        policy_lp = torch.randn(4, 10) * 0.1
+        ref_lp = policy_lp.detach().clone() - 0.5
+        adv = torch.randn(4)
+        mask = torch.zeros(4, 10)
+        mask[:, 3:] = 1.0
+
+        _, m1 = cispo_loss(policy_lp, None, adv, mask, kl_coeff=0.0)
+        _, m2 = cispo_loss(policy_lp, None, adv, mask, kl_coeff=0.1, ref_log_probs=ref_lp)
+
+        assert "kl" not in m1
+        assert "kl" in m2
+
+    def test_cispo_matches_grpo_when_num_iterations_1(self):
+        """With old_log_probs=None, both losses produce identical gradients."""
+        torch.manual_seed(42)
+        policy_lp_grpo = torch.randn(4, 10, requires_grad=True)
+        policy_lp_cispo = policy_lp_grpo.detach().clone().requires_grad_(True)
+        adv = torch.tensor([1.0, -1.0, 0.5, -0.5])
+        mask = torch.ones(4, 10)
+
+        loss_g, _ = grpo_loss(policy_lp_grpo, None, adv, mask)
+        loss_g.backward()
+
+        loss_c, _ = cispo_loss(policy_lp_cispo, None, adv, mask)
+        loss_c.backward()
+
+        assert torch.allclose(policy_lp_grpo.grad, policy_lp_cispo.grad, atol=1e-5), (
+            "With num_iterations=1, CISPO and GRPO should produce identical gradients"
         )
