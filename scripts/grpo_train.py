@@ -134,10 +134,27 @@ class GRPOConfig:
 # ---------------------------------------------------------------------------
 
 
-# Env vars set by torchrun that must be cleared before spawning vLLM.
-# The EngineCore child process inherits these and tries to init_process_group
-# against the training group it's not part of, causing a 600s TCP timeout.
-_TORCHRUN_ENV_VARS = ("MASTER_ADDR", "MASTER_PORT", "RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "GROUP_RANK")
+# Env vars set by torchrun that must be cleared before creating vLLM.
+# Without clearing, vLLM's subprocess (or in-process init) tries to join
+# the training process group it's not part of, causing a 600s TCP timeout.
+_TORCHRUN_ENV_VARS = (
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "RANK",
+    "LOCAL_RANK",
+    "WORLD_SIZE",
+    "LOCAL_WORLD_SIZE",
+    "GROUP_RANK",
+    "TORCHELASTIC_RESTART_COUNT",
+    "TORCHELASTIC_MAX_RESTARTS",
+    "TORCHELASTIC_RUN_ID",
+)
+
+# vLLM env vars that must be overridden for torchrun isolation.
+_VLLM_ENV_OVERRIDES = ("CUDA_VISIBLE_DEVICES", "VLLM_HOST_IP", "VLLM_ENABLE_V1_MULTIPROCESSING")
+
+# Combined list for save / clear / restore cycle.
+_ISOLATED_ENV_VARS = (*_TORCHRUN_ENV_VARS, *_VLLM_ENV_OVERRIDES)
 
 
 def create_vllm(
@@ -151,24 +168,42 @@ def create_vllm(
     """Create a vLLM LLM instance for generation.
 
     Env var isolation for torchrun + per-rank vLLM:
-    1. CUDA_VISIBLE_DEVICES — vLLM defaults to GPU 0; we restrict visibility
-       so the spawned EngineCore child binds to the correct physical GPU.
-    2. Torchrun env vars — the child inherits MASTER_ADDR/PORT/RANK/WORLD_SIZE
-       and tries to join the training process group (→ 600s timeout). We clear
-       these so vLLM creates its own isolated group.
-    3. VLLM_HOST_IP — vLLM discovers the machine's external IP via UDP, but
-       cluster firewalls may block self-connections on the external IP. We force
-       localhost since each vLLM instance is single-GPU (world_size=1).
 
-    The parent process's CUDA context is already initialized and unaffected
-    by env var changes. All vars are restored after the child is spawned.
+    1. VLLM_ENABLE_V1_MULTIPROCESSING=0 — vLLM V1 (>=0.8) spawns a child
+       process for the EngineCore by default.  Under torchrun CUDA is already
+       initialized, so vLLM forces the ``spawn`` start method; the spawned
+       subprocess then fails ("engine core initialization failed").  Setting
+       this to ``0`` keeps the EngineCore in-process, side-stepping the issue.
+
+    2. LOCAL_RANK — cleared with other torchrun vars, then re-set to
+       ``gpu_id``.  vLLM reads ``LOCAL_RANK`` to call
+       ``torch.cuda.set_device``; without it the in-process engine defaults
+       to ``cuda:0`` regardless of rank.
+
+    3. CUDA_VISIBLE_DEVICES — still set as a safety net: if vLLM spawns any
+       helper subprocess it will inherit a single-GPU view.
+
+    4. Torchrun env vars — MASTER_ADDR/PORT/RANK/WORLD_SIZE etc. are cleared
+       so vLLM never attempts to join the training process group.
+
+    5. VLLM_HOST_IP=127.0.0.1 — avoids firewall issues with vLLM's UDP-based
+       external-IP discovery (single-GPU instances don't need it).
+
+    All vars are restored after vLLM is created.
     """
     saved_env: dict[str, str] = {}
-    for var in (*_TORCHRUN_ENV_VARS, "CUDA_VISIBLE_DEVICES", "VLLM_HOST_IP"):
+    for var in _ISOLATED_ENV_VARS:
         if var in os.environ:
             saved_env[var] = os.environ.pop(var)
+
+    # --- Set isolation overrides ---
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     os.environ["VLLM_HOST_IP"] = "127.0.0.1"
+    # Keep EngineCore in-process — avoids subprocess spawn failure under torchrun.
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    # Re-set LOCAL_RANK so the in-process vLLM worker binds to the right GPU.
+    os.environ["LOCAL_RANK"] = str(gpu_id)
+
     try:
         return LLM(
             model=model_path,
@@ -180,7 +215,7 @@ def create_vllm(
         )
     finally:
         # Remove any vars we set, then restore originals.
-        for var in (*_TORCHRUN_ENV_VARS, "CUDA_VISIBLE_DEVICES", "VLLM_HOST_IP"):
+        for var in _ISOLATED_ENV_VARS:
             os.environ.pop(var, None)
         os.environ.update(saved_env)
 
