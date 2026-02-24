@@ -15,7 +15,6 @@ from scripts.grpo_train import (
     create_vllm,
     destroy_vllm,
     find_truncated_completions,
-    generate_rollouts,
     generate_with_vllm,
     pad_token_id_pairs,
     stitch_interruptions,
@@ -55,12 +54,9 @@ def rollout_results(tokenizer):
         stop_token_ids=[EOS_TOKEN_ID],
         skip_special_tokens=False,
     )
-    response_ids = generate_rollouts(
-        MODEL_NAME,
-        prompt_token_ids,
-        sampling_params,
-        max_model_len=MAX_MODEL_LEN,
-    )
+    llm = create_vllm(MODEL_NAME, max_model_len=MAX_MODEL_LEN)
+    response_ids = generate_with_vllm(llm, prompt_token_ids, sampling_params)
+    destroy_vllm(llm)
     return prompt_token_ids, response_ids, formatted_prompts
 
 

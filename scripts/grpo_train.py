@@ -1,22 +1,25 @@
 """GRPO training loop for Ouro-1.4B-Thinking.
 
 Orchestrates: vLLM rollout generation → reward scoring → GRPO policy update.
+Supports data-parallel training and generation across multiple GPUs.
 
 Usage:
-    uv run python scripts/grpo_train.py
-    uv run python scripts/grpo_train.py --smoke-test --no-wandb # 3 steps, small batch
-    uv run python scripts/grpo_train.py --num-steps 140         # full training run
+    torchrun --standalone --nproc_per_node=1 scripts/grpo_train.py --smoke-test --no-wandb  # single GPU
+    torchrun --standalone --nproc_per_node=2 scripts/grpo_train.py                          # multi-GPU
 
 Architecture:
     - vLLM: generates rollouts (created/destroyed each step to free GPU memory)
     - HF Transformers: policy + reference model for log-prob computation + training
     - Weight sync: save checkpoint to disk → vLLM reloads from checkpoint next step
+    - Multi-GPU: data-parallel generation (each GPU runs independent vLLM) +
+      manual gradient sync for training (no DDP wrapper, compatible with CPU↔GPU swap)
 """
 
 import argparse
 import gc
 import json
 import logging
+import os
 import random
 import shutil
 import time
@@ -24,12 +27,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 from ouro_rl.data import INTERRUPTION_PHRASE, format_prompt, load_math_train
+from ouro_rl.distributed import broadcast_object, get_rank, get_world_size, is_dist, shard_range, sync_gradients, sync_metrics
 from ouro_rl.grpo import cispo_loss, compute_advantages, compute_log_probs_batch, compute_log_probs_with_grad, grpo_loss
-from ouro_rl.modeling import CHAT_TEMPLATE, EOS_TOKEN_ID, OuroForCausalLM
+from ouro_rl.modeling import BOS_TOKEN_ID, CHAT_TEMPLATE, EOS_TOKEN_ID, PAD_TOKEN_ID, OuroForCausalLM
 from ouro_rl.reward import score_answer
 
 logger = logging.getLogger(__name__)
@@ -70,7 +75,6 @@ class GRPOConfig:
     kl_coeff: float = 0.0  # KL not needed with verifiable rewards (DAPO, Open-Reasoner-Zero)
     scale_rewards: str = "batch"  # "batch" (group mean, batch std), "group" (per-group std), "none" (no std)
     num_iterations: int = 1  # μ: number of policy updates per generation batch (ScaleRL uses μ=2)
-    mask_truncated_completions: bool = False  # Include truncated completions (reward=0 → negative advantage teaches brevity)
     token_level_loss: bool = True  # Token-level average (avoids length bias) vs per-sequence average
 
     # Generation
@@ -130,22 +134,55 @@ class GRPOConfig:
 # ---------------------------------------------------------------------------
 
 
+# Env vars set by torchrun that must be cleared before spawning vLLM.
+# The EngineCore child process inherits these and tries to init_process_group
+# against the training group it's not part of, causing a 600s TCP timeout.
+_TORCHRUN_ENV_VARS = ("MASTER_ADDR", "MASTER_PORT", "RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "GROUP_RANK")
+
+
 def create_vllm(
     model_path: str,
     *,
     dtype: str = "bfloat16",
     max_model_len: int = 4096,
     trust_remote_code: bool = True,
+    gpu_id: int = 0,
 ) -> LLM:
-    """Create a vLLM LLM instance for generation."""
-    return LLM(
-        model=model_path,
-        trust_remote_code=trust_remote_code,
-        dtype=dtype,
-        max_model_len=max_model_len,
-        enforce_eager=True,  # Simpler, avoids CUDA graph issues with model swapping.
-        skip_tokenizer_init=True,
-    )
+    """Create a vLLM LLM instance for generation.
+
+    Env var isolation for torchrun + per-rank vLLM:
+    1. CUDA_VISIBLE_DEVICES — vLLM defaults to GPU 0; we restrict visibility
+       so the spawned EngineCore child binds to the correct physical GPU.
+    2. Torchrun env vars — the child inherits MASTER_ADDR/PORT/RANK/WORLD_SIZE
+       and tries to join the training process group (→ 600s timeout). We clear
+       these so vLLM creates its own isolated group.
+    3. VLLM_HOST_IP — vLLM discovers the machine's external IP via UDP, but
+       cluster firewalls may block self-connections on the external IP. We force
+       localhost since each vLLM instance is single-GPU (world_size=1).
+
+    The parent process's CUDA context is already initialized and unaffected
+    by env var changes. All vars are restored after the child is spawned.
+    """
+    saved_env: dict[str, str] = {}
+    for var in (*_TORCHRUN_ENV_VARS, "CUDA_VISIBLE_DEVICES", "VLLM_HOST_IP"):
+        if var in os.environ:
+            saved_env[var] = os.environ.pop(var)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ["VLLM_HOST_IP"] = "127.0.0.1"
+    try:
+        return LLM(
+            model=model_path,
+            trust_remote_code=trust_remote_code,
+            dtype=dtype,
+            max_model_len=max_model_len,
+            enforce_eager=True,  # Simpler, avoids CUDA graph issues with model swapping.
+            skip_tokenizer_init=True,
+        )
+    finally:
+        # Remove any vars we set, then restore originals.
+        for var in (*_TORCHRUN_ENV_VARS, "CUDA_VISIBLE_DEVICES", "VLLM_HOST_IP"):
+            os.environ.pop(var, None)
+        os.environ.update(saved_env)
 
 
 def destroy_vllm(llm: LLM) -> None:
@@ -217,27 +254,6 @@ def stitch_interruptions(
     """
     for idx, (pi, ri) in enumerate(needs_interruption):
         rollout_response_ids[pi][ri] = rollout_response_ids[pi][ri] + interruption_token_ids + phase2_responses[idx][0]
-
-
-def generate_rollouts(
-    model_path: str,
-    prompt_token_ids: list[list[int]],
-    sampling_params: SamplingParams,
-    *,
-    dtype: str = "bfloat16",
-    max_model_len: int = 4096,
-    trust_remote_code: bool = True,
-) -> list[list[list[int]]]:
-    """Generate rollouts, managing the vLLM lifecycle internally.
-
-    Convenience wrapper: creates a vLLM instance, generates, then destroys it
-    to free GPU memory. Use create_vllm/generate_with_vllm/destroy_vllm directly
-    when multiple generation calls share the same instance (e.g. interruptions).
-    """
-    llm = create_vllm(model_path, dtype=dtype, max_model_len=max_model_len, trust_remote_code=trust_remote_code)
-    result = generate_with_vllm(llm, prompt_token_ids, sampling_params)
-    destroy_vllm(llm)
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +412,9 @@ def train_step(
         for k, v in metrics.items():
             total_metrics[k] = total_metrics.get(k, 0.0) + v / num_micro_batches
 
+    # Sync gradients across ranks before clipping.
+    sync_gradients(policy_model)
+
     grad_norm = torch.nn.utils.clip_grad_norm_(policy_model.parameters(), config.max_grad_norm)
     optimizer.step()
     scheduler.step()
@@ -419,34 +438,49 @@ def set_seed(seed: int) -> None:
 def main(config: GRPOConfig) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 
+    # Distributed setup — always use torchrun (even single-GPU: torchrun --standalone --nproc_per_node=1).
+    dist.init_process_group(backend="nccl")
+    rank = get_rank()
+    world_size = get_world_size()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+
+    assert config.prompt_batch_size % world_size == 0, (
+        f"prompt_batch_size ({config.prompt_batch_size}) must be divisible by world_size ({world_size})"
+    )
+
     set_seed(config.seed)
 
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save config.
-    with open(output_dir / "config.json", "w") as f:
-        json.dump(config.__dict__, f, indent=2, default=str)
+    # Save config (rank 0 only).
+    if rank == 0:
+        with open(output_dir / "config.json", "w") as f:
+            json.dump(config.__dict__, f, indent=2, default=str)
 
-    # Wandb setup.
-    if config.wandb_enabled:
+    # Wandb setup (rank 0 only).
+    if config.wandb_enabled and rank == 0:
         import wandb
 
         wandb.init(project=config.wandb_project, name=config.wandb_run_name, config=config.__dict__)
 
     # Load tokenizer with fixed token IDs and chat template.
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    tokenizer.bos_token_id = 1  # <|im_start|>
-    tokenizer.eos_token_id = 2  # <|im_end|>
-    tokenizer.pad_token_id = 0  # <|endoftext|>
+    tokenizer.bos_token_id = BOS_TOKEN_ID
+    tokenizer.eos_token_id = EOS_TOKEN_ID
+    tokenizer.pad_token_id = PAD_TOKEN_ID
     tokenizer.chat_template = CHAT_TEMPLATE
 
     # Load dataset.
-    logger.info("Loading MATH dataset: %s", config.dataset_name)
+    if rank == 0:
+        logger.info("Loading MATH dataset: %s", config.dataset_name)
     dataset = load_math_train(config.dataset_name)
     problems = dataset["problem"]
     solutions = dataset["solution"]
-    logger.info("Loaded %d problems", len(problems))
+    if rank == 0:
+        logger.info("Loaded %d problems", len(problems))
 
     # vLLM sampling params.
     # NOTE: stop_token_ids is required because the upstream Ouro model ships
@@ -467,11 +501,12 @@ def main(config: GRPOConfig) -> None:
 
     # Load policy + reference models for training.
     torch_dtype = getattr(torch, config.dtype)
-    logger.info("Loading policy model: %s", config.model_name)
+    if rank == 0:
+        logger.info("Loading policy model: %s", config.model_name)
     policy_model = OuroForCausalLM.from_pretrained(
         config.model_name,
         torch_dtype=torch_dtype,
-        device_map="cuda",
+        device_map={"": device},
     )
     if config.fp32_lm_head:
         policy_model.enable_fp32_lm_head()
@@ -479,11 +514,12 @@ def main(config: GRPOConfig) -> None:
 
     ref_model = None
     if config.kl_coeff > 0:
-        logger.info("Loading reference model: %s", config.model_name)
+        if rank == 0:
+            logger.info("Loading reference model: %s", config.model_name)
         ref_model = OuroForCausalLM.from_pretrained(
             config.model_name,
             torch_dtype=torch_dtype,
-            device_map="cuda",
+            device_map={"": device},
         )
         if config.fp32_lm_head:
             ref_model.enable_fp32_lm_head()
@@ -491,7 +527,8 @@ def main(config: GRPOConfig) -> None:
         for p in ref_model.parameters():
             p.requires_grad = False
     else:
-        logger.info("KL disabled (kl_coeff=0) — skipping reference model")
+        if rank == 0:
+            logger.info("KL disabled (kl_coeff=0) — skipping reference model")
 
     # Optimizer + scheduler.
     optimizer = torch.optim.AdamW(
@@ -509,13 +546,15 @@ def main(config: GRPOConfig) -> None:
     # -----------------------------------------------------------------------
     # Training loop
     # -----------------------------------------------------------------------
-    logger.info("Starting GRPO training: %d steps", config.num_steps)
+    if rank == 0:
+        logger.info("Starting GRPO training: %d steps, %d GPU(s)", config.num_steps, world_size)
 
     for step in range(1, config.num_steps + 1):
         step_start = time.time()
 
-        # --- 1. Sample prompts ---
-        indices = random.sample(range(len(problems)), config.prompt_batch_size)
+        # --- 1. Sample prompts (rank 0 → broadcast) ---
+        indices = random.sample(range(len(problems)), config.prompt_batch_size) if rank == 0 else None
+        indices = broadcast_object(indices)
         batch_problems = [problems[i] for i in indices]
         batch_solutions = [solutions[i] for i in indices]
 
@@ -528,8 +567,9 @@ def main(config: GRPOConfig) -> None:
         # (which has wrong bos/eos/pad from upstream Ouro config).
         prompt_token_ids = [tokenizer.encode(p) for p in prompts]
 
-        # --- 2. Generate rollouts with vLLM ---
-        logger.info("[Step %d/%d] Generating %d rollouts...", step, config.num_steps, config.total_rollouts_per_step)
+        # --- 2. Generate rollouts with vLLM (data-parallel) ---
+        if rank == 0:
+            logger.info("[Step %d/%d] Generating %d rollouts...", step, config.num_steps, config.total_rollouts_per_step)
 
         # Move training models + optimizer state to CPU to free GPU memory for vLLM.
         policy_model.cpu()
@@ -544,9 +584,17 @@ def main(config: GRPOConfig) -> None:
         gen_start = time.time()
         n_interrupted = 0
 
+        # Split prompts across ranks — each rank generates its subset independently.
+        my_start, my_end = shard_range(len(prompt_token_ids), rank, world_size)
+        my_prompt_token_ids = prompt_token_ids[my_start:my_end]
+        my_num_prompts = len(my_prompt_token_ids)
+
         if config.enable_interruptions:
             # Two-phase generation: thinking → interruption → answer.
-            thinking_budget = random.randint(config.thinking_budget_min, config.thinking_budget_max)
+            # Sync thinking budget so all ranks use the same value.
+            thinking_budget = random.randint(config.thinking_budget_min, config.thinking_budget_max) if rank == 0 else 0
+            thinking_budget = broadcast_object(thinking_budget)
+
             phase1_params = SamplingParams(
                 n=config.rollouts_per_prompt,
                 temperature=config.temperature,
@@ -556,21 +604,20 @@ def main(config: GRPOConfig) -> None:
                 skip_special_tokens=False,
             )
 
-            llm = create_vllm(current_model_path, dtype=config.dtype, max_model_len=config.max_model_len)
-            rollout_response_ids = generate_with_vllm(llm, prompt_token_ids, phase1_params)
+            llm = create_vllm(current_model_path, dtype=config.dtype, max_model_len=config.max_model_len, gpu_id=local_rank)
+            my_rollout_ids = generate_with_vllm(llm, my_prompt_token_ids, phase1_params)
 
-            # Identify truncated completions (no EOS and no </think> → thinking was cut off).
+            # Identify truncated completions on this rank's subset.
             think_close_id = tokenizer.convert_tokens_to_ids("</think>")
             interruption_token_ids = tokenizer.encode(INTERRUPTION_PHRASE, add_special_tokens=False)
 
-            needs_interruption = find_truncated_completions(rollout_response_ids, EOS_TOKEN_ID, think_close_id)
-            n_interrupted = len(needs_interruption)
+            needs_interruption = find_truncated_completions(my_rollout_ids, EOS_TOKEN_ID, think_close_id)
+            my_n_interrupted = len(needs_interruption)
 
-            if n_interrupted > 0:
+            if my_n_interrupted > 0:
                 # Build phase 2 prompts: original prompt + thinking + interruption phrase.
                 phase2_prompt_ids = [
-                    prompt_token_ids[pi] + rollout_response_ids[pi][ri] + interruption_token_ids
-                    for pi, ri in needs_interruption
+                    my_prompt_token_ids[pi] + my_rollout_ids[pi][ri] + interruption_token_ids for pi, ri in needs_interruption
                 ]
 
                 phase2_params = SamplingParams(
@@ -583,50 +630,63 @@ def main(config: GRPOConfig) -> None:
                 )
                 phase2_responses = generate_with_vllm(llm, phase2_prompt_ids, phase2_params)
 
-                stitch_interruptions(rollout_response_ids, needs_interruption, interruption_token_ids, phase2_responses)
+                stitch_interruptions(my_rollout_ids, needs_interruption, interruption_token_ids, phase2_responses)
 
             destroy_vllm(llm)
-            logger.info(
-                "[Step %d/%d] Generation complete: %d/%d interrupted",
-                step,
-                config.num_steps,
-                n_interrupted,
-                config.total_rollouts_per_step,
-            )
+
+            # Sum interrupted counts across ranks for logging.
+            n_interrupted_t = torch.tensor([my_n_interrupted], device=device, dtype=torch.long)
+            if is_dist():
+                dist.all_reduce(n_interrupted_t, op=dist.ReduceOp.SUM)
+            n_interrupted = int(n_interrupted_t.item())
+
+            if rank == 0:
+                logger.info(
+                    "[Step %d/%d] Generation complete: %d/%d interrupted",
+                    step,
+                    config.num_steps,
+                    n_interrupted,
+                    config.total_rollouts_per_step,
+                )
         else:
-            rollout_response_ids = generate_rollouts(
-                current_model_path,
-                prompt_token_ids,
-                sampling_params,
-                dtype=config.dtype,
-                max_model_len=config.max_model_len,
-            )
+            llm = create_vllm(current_model_path, dtype=config.dtype, max_model_len=config.max_model_len, gpu_id=local_rank)
+            my_rollout_ids = generate_with_vllm(llm, my_prompt_token_ids, sampling_params)
+            destroy_vllm(llm)
 
         gen_time = time.time() - gen_start
 
-        # Decode response token IDs to text (vLLM skips tokenizer, so we do it here).
-        rollout_texts = [[tokenizer.decode(ids) for ids in prompt_rollouts] for prompt_rollouts in rollout_response_ids]
+        # Decode local rollout token IDs to text (vLLM skips tokenizer, so we do it here).
+        rollout_texts = [[tokenizer.decode(ids) for ids in prompt_rollouts] for prompt_rollouts in my_rollout_ids]
 
-        # Completion length stats (computed early so skipped steps can still log them).
-        all_response_lengths = [len(ids) for prompt_rollouts in rollout_response_ids for ids in prompt_rollouts]
+        # Completion length stats (local, synced across ranks for logging).
+        all_response_lengths = [len(ids) for prompt_rollouts in my_rollout_ids for ids in prompt_rollouts]
         mean_completion_len = sum(all_response_lengths) / len(all_response_lengths)
         max_completion_len = max(all_response_lengths)
         min_completion_len = min(all_response_lengths)
         clipped_ratio = sum(
-            1 for prompt_rollouts in rollout_response_ids for ids in prompt_rollouts if not ids or ids[-1] != EOS_TOKEN_ID
+            1 for prompt_rollouts in my_rollout_ids for ids in prompt_rollouts if not ids or ids[-1] != EOS_TOKEN_ID
         ) / len(all_response_lengths)
         completion_log_data: dict[str, float] = {
             "completions/mean_length": mean_completion_len,
-            "completions/max_length": max_completion_len,
-            "completions/min_length": min_completion_len,
             "completions/clipped_ratio": clipped_ratio,
         }
         if config.enable_interruptions:
-            completion_log_data["completions/interrupted_ratio"] = n_interrupted / len(all_response_lengths)
+            completion_log_data["completions/interrupted_ratio"] = n_interrupted / config.total_rollouts_per_step
             completion_log_data["completions/thinking_budget"] = thinking_budget
+        completion_log_data = sync_metrics(completion_log_data, device)
+
+        # Max/min need dedicated reduce ops (AVG is wrong for extrema).
+        if is_dist():
+            max_t = torch.tensor(max_completion_len, dtype=torch.float32, device=device)
+            min_t = torch.tensor(min_completion_len, dtype=torch.float32, device=device)
+            dist.all_reduce(max_t, op=dist.ReduceOp.MAX)
+            dist.all_reduce(min_t, op=dist.ReduceOp.MIN)
+            max_completion_len = int(max_t.item())
+            min_completion_len = int(min_t.item())
+        completion_log_data["completions/max_length"] = max_completion_len
+        completion_log_data["completions/min_length"] = min_completion_len
 
         # Move training models + optimizer state back to GPU.
-        device = torch.device("cuda")
         policy_model.to(device)
         if ref_model is not None:
             ref_model.to(device)
@@ -635,33 +695,59 @@ def main(config: GRPOConfig) -> None:
                 if isinstance(v, torch.Tensor):
                     state[k] = v.to(device)
 
-        # --- 3. Score rollouts ---
+        # --- 3. Score rollouts (each rank scores its own subset) ---
         rewards_list: list[list[float]] = []
-        for prompt_idx in range(config.prompt_batch_size):
+        for prompt_idx in range(my_num_prompts):
             group_rewards = []
             for rollout_idx in range(config.rollouts_per_prompt):
-                r = score_answer(rollout_texts[prompt_idx][rollout_idx], batch_solutions[prompt_idx])
+                r = score_answer(rollout_texts[prompt_idx][rollout_idx], batch_solutions[my_start + prompt_idx])
                 group_rewards.append(r)
             rewards_list.append(group_rewards)
 
-        rewards = torch.tensor(rewards_list, dtype=torch.float32)  # (num_prompts, rollouts)
+        rewards = torch.tensor(rewards_list, dtype=torch.float32)  # (my_num_prompts, rollouts)
         mean_reward = rewards.mean().item()
         fraction_correct = (rewards > 0).float().mean().item()
         frac_reward_zero_std = (rewards.std(dim=1) == 0).float().mean().item()
 
-        # --- 4. Compute advantages ---
-        advantages = compute_advantages(rewards, scale_rewards=config.scale_rewards)  # (num_prompts, rollouts)
+        # Sync reward stats across ranks for consistent logging.
+        reward_stats = sync_metrics(
+            {"mean_reward": mean_reward, "fraction_correct": fraction_correct, "frac_reward_zero_std": frac_reward_zero_std},
+            device,
+        )
+        mean_reward = reward_stats["mean_reward"]
+        fraction_correct = reward_stats["fraction_correct"]
+        frac_reward_zero_std = reward_stats["frac_reward_zero_std"]
 
-        # Skip step if all advantages are zero (no learning signal).
-        if (advantages == 0).all():
+        # --- 4. Compute advantages (group mean is local, batch std is global) ---
+        batch_std = None
+        if config.scale_rewards == "batch" and is_dist():
+            stats = torch.stack([rewards.sum(), (rewards**2).sum(), torch.tensor(float(rewards.numel()))])
+            stats = stats.to(device)
+            dist.all_reduce(stats)
+            global_mean = stats[0] / stats[2]
+            batch_std = ((stats[1] / stats[2]) - global_mean**2).clamp(min=0).sqrt().cpu()
+        advantages = compute_advantages(rewards, scale_rewards=config.scale_rewards, batch_std=batch_std)
+
+        # Flatten local data for training.
+        flat_advantages = advantages.reshape(-1)
+        flat_prompt_ids = [my_prompt_token_ids[i] for i in range(my_num_prompts) for _ in range(config.rollouts_per_prompt)]
+        flat_response_ids = [my_rollout_ids[i][j] for i in range(my_num_prompts) for j in range(config.rollouts_per_prompt)]
+
+        # --- 5. Skip step if no learning signal (coordinated across all ranks) ---
+        local_has_signal = float((flat_advantages != 0).any())
+        signal_t = torch.tensor([local_has_signal], device=device)
+        if is_dist():
+            dist.all_reduce(signal_t, op=dist.ReduceOp.MAX)
+        if signal_t.item() == 0:
             step_time = time.time() - step_start
-            logger.info(
-                "[Step %d/%d] All-zero advantages (reward=%.3f), skipping update.",
-                step,
-                config.num_steps,
-                mean_reward,
-            )
-            if config.wandb_enabled:
+            if rank == 0:
+                logger.info(
+                    "[Step %d/%d] All-zero advantages (reward=%.3f), skipping update.",
+                    step,
+                    config.num_steps,
+                    mean_reward,
+                )
+            if config.wandb_enabled and rank == 0:
                 import wandb
 
                 wandb.log(
@@ -669,8 +755,6 @@ def main(config: GRPOConfig) -> None:
                         "step": step,
                         "reward/mean": mean_reward,
                         "reward/fraction_correct": fraction_correct,
-                        "reward/kept_mean": mean_reward,
-                        "reward/kept_fraction_correct": fraction_correct,
                         "reward/frac_zero_std": frac_reward_zero_std,
                         **completion_log_data,
                         "time/step_total": step_time,
@@ -686,68 +770,7 @@ def main(config: GRPOConfig) -> None:
                 )
             continue
 
-        # Flatten: (num_prompts, rollouts) → (total_rollouts,)
-        flat_advantages = advantages.reshape(-1)
-
-        # Build flat lists for tokenization and reward filtering.
-        flat_prompt_ids = [
-            prompt_token_ids[i] for i in range(config.prompt_batch_size) for _ in range(config.rollouts_per_prompt)
-        ]
-        flat_response_ids = [
-            rollout_response_ids[i][j] for i in range(config.prompt_batch_size) for j in range(config.rollouts_per_prompt)
-        ]
-        # --- 5. Filter truncated completions (no EOS → no learning signal) ---
-        # Drop them before tokenization to avoid wasting compute on zero-gradient sequences.
-        # A response that completed naturally ends with EOS (stop token is included
-        # in token_ids). Truncated responses (hit max_tokens) won't have it.
-        kept_reward_mean = mean_reward
-        kept_fraction_correct = fraction_correct
-        if config.mask_truncated_completions:
-            keep = [r[-1] == EOS_TOKEN_ID if r else False for r in flat_response_ids]
-            n_total = len(flat_response_ids)
-            n_truncated = n_total - sum(keep)
-
-            if n_truncated > 0 and n_truncated < n_total:
-                flat_prompt_ids = [p for p, k in zip(flat_prompt_ids, keep) if k]
-                flat_response_ids = [r for r, k in zip(flat_response_ids, keep) if k]
-                flat_advantages = flat_advantages[torch.tensor(keep)]
-                # Reward stats for non-truncated samples only.
-                kept_rewards = rewards.reshape(-1)[torch.tensor(keep)]
-                kept_reward_mean = kept_rewards.mean().item()
-                kept_fraction_correct = (kept_rewards > 0).float().mean().item()
-            elif n_truncated == n_total:
-                step_time = time.time() - step_start
-                logger.info(
-                    "[Step %d/%d] All completions truncated, skipping update.",
-                    step,
-                    config.num_steps,
-                )
-                if config.wandb_enabled:
-                    import wandb
-
-                    wandb.log(
-                        {
-                            "step": step,
-                            "reward/mean": mean_reward,
-                            "reward/fraction_correct": fraction_correct,
-                            "reward/kept_mean": 0.0,
-                            "reward/kept_fraction_correct": 0.0,
-                            "reward/frac_zero_std": frac_reward_zero_std,
-                            **completion_log_data,
-                            "time/step_total": step_time,
-                            "time/generation": gen_time,
-                            "time/training": 0.0,
-                            "train/surrogate_loss": 0.0,
-                            "train/mean_ratio": 1.0,
-                            "train/clip_ratio": 0.0,
-                            "train/grad_norm": 0.0,
-                            "train/lr": scheduler.get_last_lr()[0],
-                            "skipped": True,
-                        }
-                    )
-                continue
-
-        # --- 5b. Pad into batched tensors ---
+        # Pad local batch into tensors (each rank already has its own shard from generation).
         max_length = config.max_model_len
         pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         tokenized = pad_token_id_pairs(flat_prompt_ids, flat_response_ids, max_length, pad_token_id=pad_id)
@@ -768,13 +791,14 @@ def main(config: GRPOConfig) -> None:
 
         step_time = time.time() - step_start
 
-        # --- 7. Logging ---
+        # --- 7. Aggregate metrics across ranks ---
+        metrics = sync_metrics(metrics, device)
+
+        # --- 8. Logging (rank 0 only) ---
         log_data = {
             "step": step,
             "reward/mean": mean_reward,
             "reward/fraction_correct": fraction_correct,
-            "reward/kept_mean": kept_reward_mean,
-            "reward/kept_fraction_correct": kept_fraction_correct,
             "reward/frac_zero_std": frac_reward_zero_std,
             **completion_log_data,
             "time/step_total": step_time,
@@ -783,19 +807,15 @@ def main(config: GRPOConfig) -> None:
             **{f"train/{k}": v for k, v in metrics.items()},
         }
 
-        if step % config.log_every == 0:
+        if step % config.log_every == 0 and rank == 0:
             kl_str = f" kl={metrics['kl']:.4f}" if "kl" in metrics else ""
-            kept_str = (
-                f" kept={kept_fraction_correct * 100:.1f}%" if completion_log_data["completions/clipped_ratio"] > 0 else ""
-            )
             logger.info(
-                "[Step %d/%d] reward=%.3f correct=%.1f%%%s len=%.0f grad=%.4f surr=%.4f%s"
+                "[Step %d/%d] reward=%.3f correct=%.1f%% len=%.0f grad=%.4f surr=%.4f%s"
                 " ratio=%.3f clip=%.3f trunc=%.1f%% gen=%.1fs train=%.1fs",
                 step,
                 config.num_steps,
                 mean_reward,
                 fraction_correct * 100,
-                kept_str,
                 completion_log_data["completions/mean_length"],
                 metrics.get("grad_norm", 0),
                 metrics.get("surrogate_loss", 0),
@@ -807,38 +827,45 @@ def main(config: GRPOConfig) -> None:
                 train_time,
             )
 
-        if config.wandb_enabled:
+        if config.wandb_enabled and rank == 0:
             import wandb
 
             wandb.log(log_data)
 
-        # --- 8. Checkpoint ---
+        # --- 9. Checkpoint (rank 0 saves, all ranks wait) ---
         if step % config.save_every == 0 or step == config.num_steps:
             ckpt_dir = output_dir / f"step_{step:04d}"
-            logger.info("Saving checkpoint to %s", ckpt_dir)
-            policy_model.save_pretrained(ckpt_dir)
-            tokenizer.save_pretrained(ckpt_dir)
+            if rank == 0:
+                logger.info("Saving checkpoint to %s", ckpt_dir)
+                policy_model.save_pretrained(ckpt_dir)
+                tokenizer.save_pretrained(ckpt_dir)
+
+                # Delete old checkpoints to save disk space.
+                if config.keep_last_n_checkpoints > 0:
+                    existing = sorted(output_dir.glob("step_*"))
+                    to_delete = existing[: -config.keep_last_n_checkpoints]
+                    for old_ckpt in to_delete:
+                        logger.info("Deleting old checkpoint: %s", old_ckpt)
+                        shutil.rmtree(old_ckpt)
+            if is_dist():
+                dist.barrier()  # Ensure checkpoint is written before any rank reads it.
             # Update model path for vLLM to load from checkpoint next step.
             current_model_path = str(ckpt_dir)
 
-            # Delete old checkpoints to save disk space.
-            if config.keep_last_n_checkpoints > 0:
-                existing = sorted(output_dir.glob("step_*"))
-                to_delete = existing[: -config.keep_last_n_checkpoints]
-                for old_ckpt in to_delete:
-                    logger.info("Deleting old checkpoint: %s", old_ckpt)
-                    shutil.rmtree(old_ckpt)
-
     # Final save.
     final_dir = output_dir / "final"
-    policy_model.save_pretrained(final_dir)
-    tokenizer.save_pretrained(final_dir)
-    logger.info("Training complete. Final model saved to %s", final_dir)
+    if rank == 0:
+        policy_model.save_pretrained(final_dir)
+        tokenizer.save_pretrained(final_dir)
+        logger.info("Training complete. Final model saved to %s", final_dir)
 
-    if config.wandb_enabled:
+    if config.wandb_enabled and rank == 0:
         import wandb
 
         wandb.finish()
+
+    if is_dist():
+        dist.destroy_process_group()
 
 
 # ---------------------------------------------------------------------------
@@ -857,7 +884,6 @@ def parse_args() -> GRPOConfig:
     p.add_argument("--kl-coeff", type=float)
     p.add_argument("--scale-rewards", choices=["batch", "group", "none"])
     p.add_argument("--num-iterations", type=int)
-    p.add_argument("--mask-truncated", dest="mask_truncated_completions", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--loss-type", choices=["grpo", "cispo"])
     p.add_argument("--clip-eps", type=float)
     p.add_argument("--truncation-max", type=float)

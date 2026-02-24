@@ -10,7 +10,11 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel
 
 
-def compute_advantages(rewards: torch.Tensor, scale_rewards: str = "group") -> torch.Tensor:
+def compute_advantages(
+    rewards: torch.Tensor,
+    scale_rewards: str = "group",
+    batch_std: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Group-relative advantage normalization.
 
     Args:
@@ -21,6 +25,8 @@ def compute_advantages(rewards: torch.Tensor, scale_rewards: str = "group") -> t
                        (Understanding R1-Zero-Like Training, arXiv:2503.20783).
             "batch" — subtract group mean, divide by *batch* std; more robust shaping
                        (Tricks or Traps? arXiv:2508.08221).
+        batch_std: Pre-computed batch std (e.g. synced across ranks for distributed).
+            Only used when scale_rewards="batch". Falls back to local std if None.
 
     Returns:
         advantages: same shape, normalized within each prompt group.
@@ -31,7 +37,8 @@ def compute_advantages(rewards: torch.Tensor, scale_rewards: str = "group") -> t
     if scale_rewards == "none":
         return rewards - mean
     elif scale_rewards == "batch":
-        batch_std = rewards.std()
+        if batch_std is None:
+            batch_std = rewards.std()
         return torch.where(batch_std > 0, (rewards - mean) / (batch_std + 1e-8), torch.zeros_like(rewards))
     else:  # "group" (default, original behavior)
         std = rewards.std(dim=1, keepdim=True)

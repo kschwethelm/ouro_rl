@@ -1,12 +1,12 @@
-"""Unit tests for grpo_train.py — pad_token_id_pairs and generate_rollouts."""
+"""Unit tests for grpo_train.py — pad_token_id_pairs and generate_with_vllm."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 from vllm.outputs import CompletionOutput, RequestOutput
 
 from ouro_rl.modeling import BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID
-from scripts.grpo_train import generate_rollouts, pad_token_id_pairs
+from scripts.grpo_train import generate_with_vllm, pad_token_id_pairs
 
 # Realistic ChatML token IDs for Ouro-Thinking.
 # <|im_start|>=1, <|im_end|>=2, <|endoftext|>=0, <think>=151648, </think>=151649
@@ -177,12 +177,10 @@ class TestPadTokenIdPairs:
 # ---------------------------------------------------------------------------
 
 
-class TestGenerateRollouts:
-    @patch("scripts.grpo_train.LLM")
-    def test_output_nesting(self, mock_llm_cls: MagicMock):
+class TestGenerateWithVllm:
+    def test_output_nesting(self):
         """2 prompts × 3 rollouts → correct nesting structure."""
         mock_llm = MagicMock()
-        mock_llm_cls.return_value = mock_llm
 
         mock_llm.generate.return_value = [
             _make_request_output(
@@ -203,7 +201,7 @@ class TestGenerateRollouts:
             ),
         ]
 
-        response_ids = generate_rollouts("fake", [[1, 2], [3, 4, 5]], MagicMock())
+        response_ids = generate_with_vllm(mock_llm, [[1, 2], [3, 4, 5]], MagicMock())
 
         # response_token_ids: [prompt_idx][rollout_idx]
         assert len(response_ids) == 2

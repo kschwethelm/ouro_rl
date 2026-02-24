@@ -4,7 +4,7 @@
 datasets/
 models/
 outputs*/
-slurm_logs/
+logs/
 knowledge/
 checkpoints/
 
@@ -22,3 +22,6 @@ __pycache__/
 
 # W&B
 wandb/
+
+# Machine-specific config
+shells/_machine_config.sh

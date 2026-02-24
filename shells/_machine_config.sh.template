@@ -1,0 +1,43 @@
+# Machine-specific configuration template
+# Copy this file to machine_config.sh and update for your environment
+# The machine_config.sh file is gitignored to prevent committing machine-specific paths
+
+# ============================================================================
+# Directory Configuration
+# ============================================================================
+BASE_DIR="/path/to/your/base/directory"
+
+# Set cache directories (datasets as subdirectory of HF_HOME)
+export HF_HOME="$BASE_DIR/LLMs/.cache/huggingface"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+
+# ============================================================================
+# SLURM Configuration - Customize for your cluster
+# ============================================================================
+
+# GPU Jobs (for training and evaluation)
+export SLURM_PARTITION_GPU="mcml-hgx-h100-94x4"  # GPU partition name
+export SLURM_QOS_GPU="mcml"                       # GPU QoS
+export NUM_GPUS="${NUM_GPUS:-2}"               # Number of GPUs per job (overridable via env)
+export SLURM_GPU_MEM=""                           # Optional: GPU memory per GPU (e.g., "20G"), leave empty if not supported
+export SLURM_MEM_GPU="64G"                        # Memory for GPU jobs
+export SLURM_MAIL_USER="your.email@example.com"  # Email for notifications
+
+# CPU Jobs (for data downloads, tokenizer training)
+export SLURM_PARTITION_CPU="lrz-cpu"             # CPU partition name
+export SLURM_QOS_CPU="cpu"                       # CPU QoS
+export SLURM_MEM_CPU="32G"                       # Memory for CPU jobs
+
+# ============================================================================
+# Validation Function
+# ============================================================================
+
+validate_config() {
+    for var in HF_HOME HF_DATASETS_CACHE; do
+        if [ -z "${!var:-}" ]; then
+            echo "ERROR: $var not set after sourcing machine_config.sh" >&2
+            return 1
+        fi
+    done
+    return 0
+}
