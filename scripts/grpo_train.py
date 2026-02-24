@@ -3,9 +3,9 @@
 Orchestrates: vLLM rollout generation → reward scoring → GRPO policy update.
 
 Usage:
-    uv run python grpo_train.py
-    uv run python grpo_train.py --smoke-test --no-wandb # 3 steps, small batch
-    uv run python grpo_train.py --num-steps 140         # full training run
+    uv run python scripts/grpo_train.py
+    uv run python scripts/grpo_train.py --smoke-test --no-wandb # 3 steps, small batch
+    uv run python scripts/grpo_train.py --num-steps 140         # full training run
 
 Architecture:
     - vLLM: generates rollouts (created/destroyed each step to free GPU memory)
@@ -47,6 +47,7 @@ class GRPOConfig:
     # Model
     model_name: str = "ByteDance/Ouro-1.4B-Thinking"
     dtype: str = "bfloat16"
+    fp32_lm_head: bool = False  # Upcast lm_head matmul to fp32 (ScaleRL fix). Disable on low VRAM.
     max_model_len: int = 6144  # vLLM context window (prompt avg 89, response p75 = 2793)
 
     # Dataset
@@ -68,7 +69,7 @@ class GRPOConfig:
     truncation_max: float = 5.0  # CISPO: IS ratio cap (insensitive to choice in {4, 5, 8})
     kl_coeff: float = 0.0  # KL not needed with verifiable rewards (DAPO, Open-Reasoner-Zero)
     scale_rewards: str = "batch"  # "batch" (group mean, batch std), "group" (per-group std), "none" (no std)
-    num_iterations: int = 2  # μ: number of policy updates per generation batch (ScaleRL uses μ=2)
+    num_iterations: int = 1  # μ: number of policy updates per generation batch (ScaleRL uses μ=2)
     mask_truncated_completions: bool = False  # Include truncated completions (reward=0 → negative advantage teaches brevity)
     token_level_loss: bool = True  # Token-level average (avoids length bias) vs per-sequence average
 
@@ -110,7 +111,9 @@ class GRPOConfig:
             self.rollouts_per_prompt = 4
             self.save_every = 1
             self.max_new_tokens = 256
-            self.max_model_len = 1024
+            self.max_model_len = 512
+            self.log_prob_micro_batch = 1
+            self.train_micro_batch = 1
             if self.enable_interruptions:
                 self.thinking_budget_min = 128
                 self.thinking_budget_max = 192
@@ -470,7 +473,8 @@ def main(config: GRPOConfig) -> None:
         torch_dtype=torch_dtype,
         device_map="cuda",
     )
-    policy_model.enable_fp32_lm_head()
+    if config.fp32_lm_head:
+        policy_model.enable_fp32_lm_head()
     policy_model.train()
 
     ref_model = None
@@ -481,7 +485,8 @@ def main(config: GRPOConfig) -> None:
             torch_dtype=torch_dtype,
             device_map="cuda",
         )
-        ref_model.enable_fp32_lm_head()
+        if config.fp32_lm_head:
+            ref_model.enable_fp32_lm_head()
         ref_model.eval()
         for p in ref_model.parameters():
             p.requires_grad = False
@@ -858,6 +863,7 @@ def parse_args() -> GRPOConfig:
     p.add_argument("--truncation-max", type=float)
     p.add_argument("--max-new-tokens", type=int)
     p.add_argument("--max-model-len", type=int)
+    p.add_argument("--fp32-lm-head", dest="fp32_lm_head", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--temperature", type=float)
     p.add_argument("--enable-interruptions", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--thinking-budget-min", type=int)
