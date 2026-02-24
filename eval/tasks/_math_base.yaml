@@ -1,0 +1,22 @@
+# Shared config for thinking-model math evaluations.
+# Not a runnable task — use as `include:` base.
+#
+# Scoring uses math-verify (via utils_math.process_results) for symbolic
+# comparison: handles \boxed{} extraction (nested braces), LaTeX normalization
+# (\frac12 vs \frac{1}{2}), and numeric equivalence. Same library as the GRPO
+# reward function (ouro_rl/reward.py).
+output_type: generate_until
+process_results: !function utils_math.process_results
+num_fewshot: 0
+repeats: 1
+generation_kwargs:
+  until:
+    - "<|im_end|>"
+  do_sample: true
+  temperature: 1.0
+  top_p: 0.7
+  max_gen_toks: 4096
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true

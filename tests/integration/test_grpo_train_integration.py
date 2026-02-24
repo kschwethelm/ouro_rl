@@ -9,9 +9,9 @@ import torch
 from transformers import AutoTokenizer
 from vllm import SamplingParams
 
-from grpo_train import generate_rollouts, pad_token_id_pairs
 from ouro_rl.data import CHAT_TEMPLATE, format_prompt
 from ouro_rl.patches import CORRECT_BOS_TOKEN_ID, CORRECT_EOS_TOKEN_ID, PAD_TOKEN_ID, patch_ouro
+from scripts.grpo_train import generate_rollouts, pad_token_id_pairs
 
 MODEL_NAME = "ByteDance/Ouro-1.4B-Thinking"
 MAX_MODEL_LEN = 512

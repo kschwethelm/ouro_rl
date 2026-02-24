@@ -47,7 +47,7 @@ class GRPOConfig:
     # Model
     model_name: str = "ByteDance/Ouro-1.4B-Thinking"
     dtype: str = "bfloat16"
-    max_model_len: int = 4096  # vLLM context window (prompt avg 89, response p75 = 2793)
+    max_model_len: int = 6144  # vLLM context window (prompt avg 89, response p75 = 2793)
 
     # Dataset
     dataset_name: str = "qwedsacf/competition_math"
@@ -71,9 +71,9 @@ class GRPOConfig:
     token_level_loss: bool = True  # Token-level average (avoids length bias) vs per-sequence average
 
     # Generation
-    max_new_tokens: int = 3072
+    max_new_tokens: int = 4096
     temperature: float = 1.0
-    top_p: float = 0.95
+    top_p: float = 0.7
     enable_thinking: bool = True
 
     # Memory

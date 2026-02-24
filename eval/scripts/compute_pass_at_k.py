@@ -1,8 +1,8 @@
 """Compute pass@k from lm-eval sample logs.
 
 Usage:
-    python scripts/compute_pass_at_k.py outputs/eval/MODEL/samples_TASK_TIMESTAMP.jsonl
-    python scripts/compute_pass_at_k.py outputs/eval/MODEL/samples_TASK_TIMESTAMP.jsonl --k 10
+    python eval/scripts/compute_pass_at_k.py eval/outputs/MODEL/samples_TASK_TIMESTAMP.jsonl
+    python eval/scripts/compute_pass_at_k.py eval/outputs/MODEL/samples_TASK_TIMESTAMP.jsonl --k 10
 """
 
 import argparse

@@ -1,0 +1,19 @@
+# AIME 2024 for thinking models (zero-shot, \boxed{} answer format).
+# Scoring: math-verify symbolic comparison (inherited from _math_base.yaml).
+# Use with: --apply_chat_template --system_instruction "..." --include_path eval/tasks
+include: _math_base.yaml
+task: aime24_thinking
+generation_kwargs:
+  until:
+    - "<|im_end|>"
+  do_sample: true
+  temperature: 1.0
+  top_p: 0.7
+  max_gen_toks: 8192
+dataset_path: Maxwell-Jia/AIME_2024
+dataset_name: null
+test_split: train
+doc_to_text: "{{Problem}}"
+doc_to_target: "{{Answer}}"
+metadata:
+  version: 1.0

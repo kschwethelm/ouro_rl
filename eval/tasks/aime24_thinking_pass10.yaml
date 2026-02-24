@@ -1,0 +1,5 @@
+# AIME 2024 pass@10 — 10 temperature-sampled completions per problem.
+# Run with --log_samples, then use eval/scripts/compute_pass_at_k.py to aggregate.
+include: aime24_thinking.yaml
+task: aime24_thinking_pass10
+repeats: 10

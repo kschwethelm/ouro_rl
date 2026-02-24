@@ -1,0 +1,12 @@
+# MATH-500 for thinking models (zero-shot, \boxed{} answer format).
+# Scoring: math-verify symbolic comparison (inherited from _math_base.yaml).
+# Use with: --apply_chat_template --system_instruction "..." --include_path eval/tasks
+include: _math_base.yaml
+task: math500_thinking
+dataset_path: HuggingFaceH4/MATH-500
+dataset_name: null
+test_split: test
+doc_to_text: "{{problem}}"
+doc_to_target: "{{answer}}"
+metadata:
+  version: 1.0

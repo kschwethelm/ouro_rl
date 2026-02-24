@@ -1,5 +1,6 @@
 # GSM8K for thinking models (zero-shot, \boxed{} answer format).
-# Use with: --apply_chat_template --system_instruction "..." --include_path eval-tasks
+# Scoring: math-verify symbolic comparison (inherited from _math_base.yaml).
+# Use with: --apply_chat_template --system_instruction "..." --include_path eval/tasks
 include: _math_base.yaml
 task: gsm8k_thinking
 dataset_path: openai/gsm8k

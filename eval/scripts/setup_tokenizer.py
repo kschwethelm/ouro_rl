@@ -4,7 +4,7 @@ Upstream Ouro tokenizer ships with bos/eos/pad all set to <|endoftext|> (id=0).
 This script fixes them and injects a chat template that supports enable_thinking.
 
 Usage:
-    uv run python scripts/setup_tokenizer.py [--model MODEL] [--output DIR]
+    uv run python eval/scripts/setup_tokenizer.py [--model MODEL] [--output DIR]
 """
 
 import argparse

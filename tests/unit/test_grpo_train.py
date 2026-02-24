@@ -5,8 +5,8 @@ from unittest.mock import MagicMock, patch
 import torch
 from vllm.outputs import CompletionOutput, RequestOutput
 
-from grpo_train import generate_rollouts, pad_token_id_pairs
 from ouro_rl.patches import CORRECT_BOS_TOKEN_ID, CORRECT_EOS_TOKEN_ID, PAD_TOKEN_ID
+from scripts.grpo_train import generate_rollouts, pad_token_id_pairs
 
 # Realistic ChatML token IDs for Ouro-Thinking.
 # <|im_start|>=1, <|im_end|>=2, <|endoftext|>=0, <think>=151648, </think>=151649
@@ -178,7 +178,7 @@ class TestPadTokenIdPairs:
 
 
 class TestGenerateRollouts:
-    @patch("grpo_train.LLM")
+    @patch("scripts.grpo_train.LLM")
     def test_output_nesting(self, mock_llm_cls: MagicMock):
         """2 prompts × 3 rollouts → correct nesting structure."""
         mock_llm = MagicMock()
