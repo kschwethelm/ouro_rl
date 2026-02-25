@@ -1,12 +1,9 @@
-"""Unit tests for grpo_train.py — pad_token_id_pairs and generate_with_vllm."""
-
-from unittest.mock import MagicMock
+"""Unit tests for grpo_train.py — pad_token_id_pairs."""
 
 import torch
-from vllm.outputs import CompletionOutput, RequestOutput
 
 from ouro_rl.modeling import BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID
-from scripts.grpo_train import generate_with_vllm, pad_token_id_pairs
+from scripts.grpo_train import pad_token_id_pairs
 
 # Realistic ChatML token IDs for Ouro-Thinking.
 # <|im_start|>=1, <|im_end|>=2, <|endoftext|>=0, <think>=151648, </think>=151649
@@ -40,40 +37,6 @@ CHATML_PROMPT_IDS = [
 ]
 # response: "4\n</think>\nThe answer is 4.<|im_end|>"
 CHATML_RESPONSE_IDS = [19, NEWLINE, THINK_CLOSE, NEWLINE, 791, 4226, 374, 220, 19, 13, IM_END]
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_completion_output(
-    index: int,
-    text: str,
-    token_ids: list[int],
-    finish_reason: str = "stop",
-) -> CompletionOutput:
-    return CompletionOutput(
-        index=index,
-        text=text,
-        token_ids=token_ids,
-        cumulative_logprob=None,
-        logprobs=None,
-        finish_reason=finish_reason,
-    )
-
-
-def _make_request_output(
-    prompt_token_ids: list[int],
-    completions: list[CompletionOutput],
-) -> RequestOutput:
-    return RequestOutput(
-        request_id="fake",
-        prompt=None,
-        prompt_token_ids=prompt_token_ids,
-        prompt_logprobs=None,
-        outputs=completions,
-        finished=True,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -170,42 +133,3 @@ class TestPadTokenIdPairs:
             assert THINK_OPEN in real_ids, f"Seq {seq_idx}: missing <think>"
             assert THINK_CLOSE in real_ids, f"Seq {seq_idx}: missing </think>"
             assert real_ids[-1] == IM_END, f"Seq {seq_idx}: last token should be <|im_end|>"
-
-
-# ---------------------------------------------------------------------------
-# TestGenerateRollouts
-# ---------------------------------------------------------------------------
-
-
-class TestGenerateWithVllm:
-    def test_output_nesting(self):
-        """2 prompts × 3 rollouts → correct nesting structure."""
-        mock_llm = MagicMock()
-
-        mock_llm.generate.return_value = [
-            _make_request_output(
-                [1, 2],
-                [
-                    _make_completion_output(0, "", [10]),
-                    _make_completion_output(1, "", [11]),
-                    _make_completion_output(2, "", [12]),
-                ],
-            ),
-            _make_request_output(
-                [3, 4, 5],
-                [
-                    _make_completion_output(0, "", [20, 21]),
-                    _make_completion_output(1, "", [22, 23]),
-                    _make_completion_output(2, "", [24, 25]),
-                ],
-            ),
-        ]
-
-        response_ids = generate_with_vllm(mock_llm, [[1, 2], [3, 4, 5]], MagicMock())
-
-        # response_token_ids: [prompt_idx][rollout_idx]
-        assert len(response_ids) == 2
-        assert len(response_ids[0]) == 3
-        assert len(response_ids[1]) == 3
-        assert response_ids[0][0] == [10]
-        assert response_ids[1][2] == [24, 25]

@@ -8,21 +8,24 @@ Usage:
     torchrun --standalone --nproc_per_node=2 scripts/grpo_train.py                          # multi-GPU
 
 Architecture:
-    - vLLM: generates rollouts (created/destroyed each step to free GPU memory)
+    - vLLM: generates rollouts in a subprocess (exits when done → OS frees all GPU memory)
     - HF Transformers: policy + reference model for log-prob computation + training
     - Weight sync: save checkpoint to disk → vLLM reloads from checkpoint next step
-    - Multi-GPU: data-parallel vLLM generation (each rank runs an independent
-      TP=1 engine via external_launcher) + manual gradient sync for training
+    - Multi-GPU: data-parallel vLLM generation (each rank spawns an independent
+      subprocess on its own GPU) + manual gradient sync for training
       (no DDP wrapper, compatible with CPU↔GPU swap)
 """
 
 import argparse
-import gc
 import json
 import logging
 import os
 import random
 import shutil
+import socket
+import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,7 +33,6 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
 
 from ouro_rl.data import INTERRUPTION_PHRASE, format_prompt, load_math_train
 from ouro_rl.distributed import broadcast_object, get_rank, get_world_size, is_dist, shard_range, sync_gradients, sync_metrics
@@ -131,98 +133,132 @@ class GRPOConfig:
 
 
 # ---------------------------------------------------------------------------
-# vLLM rollout generation
+# vLLM rollout generation (subprocess)
 # ---------------------------------------------------------------------------
 
+_WORKER_SCRIPT = str(Path(__file__).parent / "vllm_worker.py")
 
-def create_vllm(
-    model_path: str,
+
+def _get_gpu_id_for_subprocess(local_rank: int) -> int:
+    """Map local_rank to a physical GPU ID for the subprocess.
+
+    Under torchrun, CUDA_VISIBLE_DEVICES may restrict which GPUs are visible.
+    local_rank indexes into that restricted set; we need the physical ID so the
+    subprocess can set CUDA_VISIBLE_DEVICES to a single device.
+
+    Examples:
+        CUDA_VISIBLE_DEVICES="0,1" + local_rank=1 → gpu_id=1
+        CUDA_VISIBLE_DEVICES="2,3" + local_rank=0 → gpu_id=2
+        CUDA_VISIBLE_DEVICES unset + local_rank=0 → gpu_id=0
+    """
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible is not None:
+        gpu_ids = [int(x) for x in cuda_visible.split(",")]
+        return gpu_ids[local_rank]
+    return local_rank
+
+
+def run_vllm_generation(
     *,
-    dtype: str = "bfloat16",
-    max_model_len: int = 4096,
-    trust_remote_code: bool = True,
-    seed: int = 0,
-) -> LLM:
-    """Create a vLLM LLM instance for generation.
-
-    Under torchrun, uses ``distributed_executor_backend="external_launcher"``
-    so each rank creates an independent TP=1 engine on its own GPU for
-    data-parallel generation.  ``external_launcher`` tells vLLM to work within
-    the existing process group instead of spawning its own workers.
-
-    ``VLLM_ENABLE_V1_MULTIPROCESSING=0`` is always set to prevent vLLM V1
-    from spawning an EngineCore subprocess (which fails under torchrun
-    because CUDA is already initialized).
-    """
-    # Keep EngineCore in-process — subprocess spawn fails under torchrun.
-    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-
-    kwargs: dict[str, object] = {}
-    if dist.is_initialized():
-        kwargs["distributed_executor_backend"] = "external_launcher"
-
-    return LLM(
-        model=model_path,
-        trust_remote_code=trust_remote_code,
-        dtype=dtype,
-        max_model_len=max_model_len,
-        enforce_eager=True,  # Simpler, avoids CUDA graph issues with model swapping.
-        skip_tokenizer_init=True,
-        seed=seed,
-        **kwargs,
-    )
-
-
-def destroy_vllm(llm: LLM) -> None:
-    """Shut down a vLLM LLM instance so GPU memory can be reclaimed.
-
-    vLLM's ``LLM`` class has no ``__del__`` or ``close()`` — simply deleting
-    the object does NOT trigger engine shutdown or NCCL cleanup.  We must
-    explicitly:
-
-    1. Shut down the engine core (model executor + scheduler).
-    2. Destroy vLLM's internal model-parallel NCCL groups — but NOT the
-       global training process group (``destroy_model_parallel`` only).
-
-    The **caller** must still ``del llm`` afterwards (this function receives
-    a local copy of the reference) and run ``gc.collect()`` +
-    ``torch.cuda.empty_cache()`` once the last reference is dropped.
-    """
-    from vllm.distributed.parallel_state import destroy_model_parallel
-
-    # Shut down engine core → model_executor.shutdown() + scheduler.shutdown().
-    # With VLLM_ENABLE_V1_MULTIPROCESSING=0 the engine_core is an InprocClient
-    # wrapping the real EngineCore; its shutdown() delegates correctly.
-    if hasattr(llm, "llm_engine"):
-        engine_core = getattr(llm.llm_engine, "engine_core", None)
-        if engine_core is not None and hasattr(engine_core, "shutdown"):
-            engine_core.shutdown()
-
-    # Destroy vLLM's TP/PP/DP NCCL sub-groups.  Do NOT call
-    # destroy_distributed_environment() — that would tear down the global
-    # torchrun process group used for training gradient sync.
-    destroy_model_parallel()
-
-
-def generate_with_vllm(
-    llm: LLM,
+    model_path: str,
+    dtype: str,
+    max_model_len: int,
+    seed: int,
     prompt_token_ids: list[list[int]],
-    sampling_params: SamplingParams,
-) -> list[list[list[int]]]:
-    """Generate rollouts using an existing vLLM instance.
+    n: int,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    stop_token_ids: list[int],
+    interruptions: dict | None = None,
+    gpu_id: int = 0,
+) -> tuple[list[list[list[int]]], int]:
+    """Run vLLM generation in a subprocess and return results.
 
-    Accepts pre-tokenized prompt_token_ids (vLLM was created with
-    skip_tokenizer_init=True). Number of rollouts per prompt is controlled
-    by sampling_params.n.
+    The subprocess creates a vLLM engine, runs all generation phases
+    (including two-phase interruptions if configured), and exits.
+    Process exit guarantees all GPU memory is freed with zero leakage.
 
     Returns:
-        response_token_ids: [prompt_idx][rollout_idx] list of token ID lists.
+        (rollout_response_ids, n_interrupted) where rollout_response_ids is
+        ``[prompt_idx][rollout_idx]`` → list of token IDs.
     """
-    outputs = llm.generate(
-        [{"prompt_token_ids": ids} for ids in prompt_token_ids],
-        sampling_params,
-    )
-    return [[list(out.token_ids) for out in output.outputs] for output in outputs]
+    request = {
+        "model_path": model_path,
+        "dtype": dtype,
+        "max_model_len": max_model_len,
+        "seed": seed,
+        "prompt_token_ids": prompt_token_ids,
+        "n": n,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+        "stop_token_ids": stop_token_ids,
+        "interruptions": interruptions,
+    }
+
+    req_fd, request_path = tempfile.mkstemp(suffix=".pt")
+    os.close(req_fd)
+    resp_fd, response_path = tempfile.mkstemp(suffix=".pt")
+    os.close(resp_fd)
+
+    try:
+        torch.save(request, request_path)
+
+        # Build a clean env: strip parent's torchrun vars, then provide a fresh
+        # single-rank distributed context so the worker can init torch.distributed
+        # and create vLLM with external_launcher (vLLM's supported approach).
+        _STRIP_VARS = {
+            "RANK",
+            "WORLD_SIZE",
+            "LOCAL_RANK",
+            "LOCAL_WORLD_SIZE",
+            "MASTER_ADDR",
+            "MASTER_PORT",
+            "GROUP_RANK",
+            "TORCHELASTIC_RESTART_COUNT",
+            "TORCHELASTIC_MAX_RESTARTS",
+            "TORCHELASTIC_RUN_ID",
+        }
+        env = {k: v for k, v in os.environ.items() if k not in _STRIP_VARS}
+        # Single-rank distributed context for the worker.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            free_port = s.getsockname()[1]
+        env["MASTER_ADDR"] = "127.0.0.1"
+        env["MASTER_PORT"] = str(free_port)
+        env["RANK"] = "0"
+        env["WORLD_SIZE"] = "1"
+        env["LOCAL_RANK"] = "0"
+        env["LOCAL_WORLD_SIZE"] = "1"
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        env["VLLM_HOST_IP"] = "127.0.0.1"
+
+        result = subprocess.run(
+            [sys.executable, _WORKER_SCRIPT, request_path, response_path],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"vLLM worker subprocess failed (exit code {result.returncode}).\n"
+                f"--- stdout ---\n{result.stdout[-2000:] if result.stdout else '(empty)'}\n"
+                f"--- stderr ---\n{result.stderr[-2000:] if result.stderr else '(empty)'}"
+            )
+
+        response = torch.load(response_path, weights_only=False)
+
+        if response["error"] is not None:
+            raise RuntimeError(f"vLLM worker encountered an error:\n{response['error']}")
+
+        return response["rollout_response_ids"], response["n_interrupted"]
+
+    finally:
+        Path(request_path).unlink(missing_ok=True)
+        Path(response_path).unlink(missing_ok=True)
 
 
 def find_truncated_completions(
@@ -494,20 +530,6 @@ def main(config: GRPOConfig) -> None:
     if rank == 0:
         logger.info("Loaded %d problems", len(problems))
 
-    # vLLM sampling params.
-    # NOTE: stop_token_ids is required because the upstream Ouro model ships
-    # with eos_token_id=0 (<|endoftext|>) in both tokenizer and model config.
-    # vLLM reads that and never stops on <|im_end|> (id=2), causing every
-    # completion to hit max_tokens and be flagged as truncated.
-    sampling_params = SamplingParams(
-        n=config.rollouts_per_prompt,
-        temperature=config.temperature,
-        top_p=config.top_p,
-        max_tokens=config.max_new_tokens,
-        stop_token_ids=[EOS_TOKEN_ID],
-        skip_special_tokens=False,  # Keep <think>...</think> for reward parsing.
-    )
-
     # The current model path — starts as the base model, updated after checkpoints.
     current_model_path = config.model_name
 
@@ -601,53 +623,38 @@ def main(config: GRPOConfig) -> None:
         my_prompt_token_ids = prompt_token_ids[my_start:my_end]
         my_num_prompts = len(my_prompt_token_ids)
 
+        gpu_id = _get_gpu_id_for_subprocess(local_rank)
+
         if config.enable_interruptions:
             # Two-phase generation: thinking → interruption → answer.
             # Sync thinking budget so all ranks use the same value.
             thinking_budget = random.randint(config.thinking_budget_min, config.thinking_budget_max) if rank == 0 else 0
             thinking_budget = broadcast_object(thinking_budget)
 
-            phase1_params = SamplingParams(
+            think_close_id = tokenizer.convert_tokens_to_ids("</think>")
+            interruption_token_ids = tokenizer.encode(INTERRUPTION_PHRASE, add_special_tokens=False)
+
+            my_rollout_ids, my_n_interrupted = run_vllm_generation(
+                model_path=current_model_path,
+                dtype=config.dtype,
+                max_model_len=config.max_model_len,
+                seed=config.seed,
+                prompt_token_ids=my_prompt_token_ids,
                 n=config.rollouts_per_prompt,
                 temperature=config.temperature,
                 top_p=config.top_p,
                 max_tokens=thinking_budget,
                 stop_token_ids=[EOS_TOKEN_ID],
-                skip_special_tokens=False,
+                interruptions={
+                    "think_close_id": think_close_id,
+                    "interruption_token_ids": interruption_token_ids,
+                    "phase2_temperature": config.temperature,
+                    "phase2_top_p": config.top_p,
+                    "phase2_max_tokens": config.answer_budget,
+                    "phase2_stop_token_ids": [EOS_TOKEN_ID],
+                },
+                gpu_id=gpu_id,
             )
-
-            llm = create_vllm(current_model_path, dtype=config.dtype, max_model_len=config.max_model_len, seed=config.seed)
-            my_rollout_ids = generate_with_vllm(llm, my_prompt_token_ids, phase1_params)
-
-            # Identify truncated completions on this rank's subset.
-            think_close_id = tokenizer.convert_tokens_to_ids("</think>")
-            interruption_token_ids = tokenizer.encode(INTERRUPTION_PHRASE, add_special_tokens=False)
-
-            needs_interruption = find_truncated_completions(my_rollout_ids, EOS_TOKEN_ID, think_close_id)
-            my_n_interrupted = len(needs_interruption)
-
-            if my_n_interrupted > 0:
-                # Build phase 2 prompts: original prompt + thinking + interruption phrase.
-                phase2_prompt_ids = [
-                    my_prompt_token_ids[pi] + my_rollout_ids[pi][ri] + interruption_token_ids for pi, ri in needs_interruption
-                ]
-
-                phase2_params = SamplingParams(
-                    n=1,
-                    temperature=config.temperature,
-                    top_p=config.top_p,
-                    max_tokens=config.answer_budget,
-                    stop_token_ids=[EOS_TOKEN_ID],
-                    skip_special_tokens=False,
-                )
-                phase2_responses = generate_with_vllm(llm, phase2_prompt_ids, phase2_params)
-
-                stitch_interruptions(my_rollout_ids, needs_interruption, interruption_token_ids, phase2_responses)
-
-            destroy_vllm(llm)
-            del llm
-            gc.collect()
-            torch.cuda.empty_cache()
 
             # Sum interrupted counts across ranks for logging.
             n_interrupted_t = torch.tensor([my_n_interrupted], device=device, dtype=torch.long)
@@ -664,12 +671,19 @@ def main(config: GRPOConfig) -> None:
                     config.total_rollouts_per_step,
                 )
         else:
-            llm = create_vllm(current_model_path, dtype=config.dtype, max_model_len=config.max_model_len, seed=config.seed)
-            my_rollout_ids = generate_with_vllm(llm, my_prompt_token_ids, sampling_params)
-            destroy_vllm(llm)
-            del llm
-            gc.collect()
-            torch.cuda.empty_cache()
+            my_rollout_ids, _ = run_vllm_generation(
+                model_path=current_model_path,
+                dtype=config.dtype,
+                max_model_len=config.max_model_len,
+                seed=config.seed,
+                prompt_token_ids=my_prompt_token_ids,
+                n=config.rollouts_per_prompt,
+                temperature=config.temperature,
+                top_p=config.top_p,
+                max_tokens=config.max_new_tokens,
+                stop_token_ids=[EOS_TOKEN_ID],
+                gpu_id=gpu_id,
+            )
 
         gen_time = time.time() - gen_start
 
