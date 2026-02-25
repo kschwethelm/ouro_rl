@@ -175,10 +175,34 @@ def create_vllm(
 
 
 def destroy_vllm(llm: LLM) -> None:
-    """Destroy a vLLM LLM instance and free GPU memory."""
-    del llm
-    gc.collect()
-    torch.cuda.empty_cache()
+    """Shut down a vLLM LLM instance so GPU memory can be reclaimed.
+
+    vLLM's ``LLM`` class has no ``__del__`` or ``close()`` — simply deleting
+    the object does NOT trigger engine shutdown or NCCL cleanup.  We must
+    explicitly:
+
+    1. Shut down the engine core (model executor + scheduler).
+    2. Destroy vLLM's internal model-parallel NCCL groups — but NOT the
+       global training process group (``destroy_model_parallel`` only).
+
+    The **caller** must still ``del llm`` afterwards (this function receives
+    a local copy of the reference) and run ``gc.collect()`` +
+    ``torch.cuda.empty_cache()`` once the last reference is dropped.
+    """
+    from vllm.distributed.parallel_state import destroy_model_parallel
+
+    # Shut down engine core → model_executor.shutdown() + scheduler.shutdown().
+    # With VLLM_ENABLE_V1_MULTIPROCESSING=0 the engine_core is an InprocClient
+    # wrapping the real EngineCore; its shutdown() delegates correctly.
+    if hasattr(llm, "llm_engine"):
+        engine_core = getattr(llm.llm_engine, "engine_core", None)
+        if engine_core is not None and hasattr(engine_core, "shutdown"):
+            engine_core.shutdown()
+
+    # Destroy vLLM's TP/PP/DP NCCL sub-groups.  Do NOT call
+    # destroy_distributed_environment() — that would tear down the global
+    # torchrun process group used for training gradient sync.
+    destroy_model_parallel()
 
 
 def generate_with_vllm(
@@ -639,6 +663,9 @@ def main(config: GRPOConfig) -> None:
             rollout_ids = generate_with_vllm(llm, prompt_token_ids, sampling_params)
 
         # Destroy vLLM and reclaim GPU memory.
+        # destroy_vllm shuts down the engine core + NCCL groups; del drops
+        # the last reference so gc can free model weights + KV cache tensors.
+        destroy_vllm(llm)
         del llm
         gc.collect()
         torch.cuda.empty_cache()

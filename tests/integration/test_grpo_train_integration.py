@@ -4,6 +4,8 @@ Run with: uv run pytest tests/integration/ -m integration -v
 Requires GPU with enough VRAM for the 1.4B model.
 """
 
+import gc
+
 import pytest
 import torch
 from transformers import AutoTokenizer
@@ -57,6 +59,9 @@ def rollout_results(tokenizer):
     llm = create_vllm(MODEL_NAME, max_model_len=MAX_MODEL_LEN)
     response_ids = generate_with_vllm(llm, prompt_token_ids, sampling_params)
     destroy_vllm(llm)
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
     return prompt_token_ids, response_ids, formatted_prompts
 
 
@@ -206,6 +211,9 @@ class TestInterruptionFlowIntegration:
         )
         phase2_responses = generate_with_vllm(llm, phase2_prompt_ids, phase2_params)
         destroy_vllm(llm)
+        del llm
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Verify phase 2 structure.
         assert len(phase2_responses) == len(needs_interruption)
@@ -269,6 +277,9 @@ class TestInterruptionFlowIntegration:
             stitch_interruptions(rollout_response_ids, needs, interruption_token_ids, phase2_responses)
 
         destroy_vllm(llm)
+        del llm
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Every response should decode cleanly.
         for prompt_rollouts in rollout_response_ids:
