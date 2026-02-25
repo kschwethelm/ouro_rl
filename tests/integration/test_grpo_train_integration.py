@@ -1,4 +1,4 @@
-"""Integration tests for grpo_train.py — real vLLM + Ouro model.
+"""Integration tests for grpo_train.py — real OuroForCausalLM + HF generate.
 
 Run with: uv run pytest tests/integration/ -m integration -v
 Requires GPU with enough VRAM for the 1.4B model.
@@ -7,15 +7,12 @@ Requires GPU with enough VRAM for the 1.4B model.
 import pytest
 import torch
 from transformers import AutoTokenizer
-from vllm import SamplingParams
 
 from ouro_rl.data import CHAT_TEMPLATE, INTERRUPTION_PHRASE, format_prompt
-from ouro_rl.modeling import BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID
+from ouro_rl.modeling import BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID, OuroForCausalLM
 from scripts.grpo_train import (
-    create_vllm,
-    destroy_vllm,
     find_truncated_completions,
-    generate_with_vllm,
+    generate_rollouts,
     pad_token_id_pairs,
     stitch_interruptions,
 )
@@ -38,7 +35,19 @@ def tokenizer() -> AutoTokenizer:
 
 
 @pytest.fixture(scope="module")
-def rollout_results(tokenizer):
+def model() -> OuroForCausalLM:
+    """Load model once per module — shared across all tests."""
+    m = OuroForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+    ).to("cuda")
+    m.eval()
+    return m
+
+
+@pytest.fixture(scope="module")
+def rollout_results(tokenizer, model):
     """Generate rollouts once and share across tests in this module.
 
     Uses format_prompt (with chat template + enable_thinking) to match the
@@ -47,16 +56,14 @@ def rollout_results(tokenizer):
     raw_prompts = ["What is 2 + 2?", "What is the capital of France?"]
     formatted_prompts = [format_prompt(p, tokenizer, enable_thinking=True) for p in raw_prompts]
     prompt_token_ids = [tokenizer.encode(p) for p in formatted_prompts]
-    sampling_params = SamplingParams(
-        n=2,
+
+    response_ids, _ = generate_rollouts(
+        model,
+        prompt_token_ids,
+        num_rollouts=2,
+        max_new_tokens=MAX_NEW_TOKENS,
         temperature=0.7,
-        max_tokens=MAX_NEW_TOKENS,
-        stop_token_ids=[EOS_TOKEN_ID],
-        skip_special_tokens=False,
     )
-    llm = create_vllm(MODEL_NAME, max_model_len=MAX_MODEL_LEN)
-    response_ids = generate_with_vllm(llm, prompt_token_ids, sampling_params)
-    destroy_vllm(llm)
     return prompt_token_ids, response_ids, formatted_prompts
 
 
@@ -147,9 +154,9 @@ ANSWER_BUDGET = 32
 @requires_cuda
 @pytest.mark.integration
 class TestInterruptionFlowIntegration:
-    """End-to-end test of the two-phase interruption pipeline with real vLLM."""
+    """End-to-end test of the two-phase interruption pipeline with real model."""
 
-    def test_two_phase_generation(self, tokenizer):
+    def test_two_phase_generation(self, tokenizer, model):
         """Phase 1 (tiny budget) → detect truncated → Phase 2 → stitch.
 
         With a 16-token thinking budget, the model won't produce </think> or EOS,
@@ -166,16 +173,13 @@ class TestInterruptionFlowIntegration:
         n_rollouts = 2
 
         # Phase 1: generate with tiny thinking budget.
-        phase1_params = SamplingParams(
-            n=n_rollouts,
+        rollout_response_ids, _ = generate_rollouts(
+            model,
+            prompt_token_ids,
+            num_rollouts=n_rollouts,
+            max_new_tokens=THINKING_BUDGET,
             temperature=0.7,
-            max_tokens=THINKING_BUDGET,
-            stop_token_ids=[EOS_TOKEN_ID],
-            skip_special_tokens=False,
         )
-
-        llm = create_vllm(MODEL_NAME, max_model_len=MAX_MODEL_LEN)
-        rollout_response_ids = generate_with_vllm(llm, prompt_token_ids, phase1_params)
 
         # Verify structure.
         assert len(rollout_response_ids) == n_prompts
@@ -197,15 +201,13 @@ class TestInterruptionFlowIntegration:
         phase2_prompt_ids = [
             prompt_token_ids[pi] + rollout_response_ids[pi][ri] + interruption_token_ids for pi, ri in needs_interruption
         ]
-        phase2_params = SamplingParams(
-            n=1,
+        phase2_responses, _ = generate_rollouts(
+            model,
+            phase2_prompt_ids,
+            num_rollouts=1,
+            max_new_tokens=ANSWER_BUDGET,
             temperature=0.7,
-            max_tokens=ANSWER_BUDGET,
-            stop_token_ids=[EOS_TOKEN_ID],
-            skip_special_tokens=False,
         )
-        phase2_responses = generate_with_vllm(llm, phase2_prompt_ids, phase2_params)
-        destroy_vllm(llm)
 
         # Verify phase 2 structure.
         assert len(phase2_responses) == len(needs_interruption)
@@ -232,7 +234,7 @@ class TestInterruptionFlowIntegration:
             decoded = tokenizer.decode(stitched)
             assert "time is up" in decoded.lower(), f"Decoded text should contain interruption phrase: {decoded[:200]}"
 
-    def test_interrupted_completions_are_decodable(self, tokenizer):
+    def test_interrupted_completions_are_decodable(self, tokenizer, model):
         """Stitched responses decode to valid text containing thinking + interruption + answer."""
         prompt = "What is 7 * 8?"
         formatted = format_prompt(prompt, tokenizer, enable_thinking=True)
@@ -241,16 +243,13 @@ class TestInterruptionFlowIntegration:
         think_close_id = tokenizer.convert_tokens_to_ids("</think>")
         interruption_token_ids = tokenizer.encode(INTERRUPTION_PHRASE, add_special_tokens=False)
 
-        phase1_params = SamplingParams(
-            n=1,
+        rollout_response_ids, _ = generate_rollouts(
+            model,
+            prompt_token_ids,
+            num_rollouts=1,
+            max_new_tokens=THINKING_BUDGET,
             temperature=0.7,
-            max_tokens=THINKING_BUDGET,
-            stop_token_ids=[EOS_TOKEN_ID],
-            skip_special_tokens=False,
         )
-
-        llm = create_vllm(MODEL_NAME, max_model_len=MAX_MODEL_LEN)
-        rollout_response_ids = generate_with_vllm(llm, prompt_token_ids, phase1_params)
 
         needs = find_truncated_completions(rollout_response_ids, EOS_TOKEN_ID, think_close_id)
 
@@ -258,17 +257,14 @@ class TestInterruptionFlowIntegration:
             phase2_prompt_ids = [
                 prompt_token_ids[pi] + rollout_response_ids[pi][ri] + interruption_token_ids for pi, ri in needs
             ]
-            phase2_params = SamplingParams(
-                n=1,
+            phase2_responses, _ = generate_rollouts(
+                model,
+                phase2_prompt_ids,
+                num_rollouts=1,
+                max_new_tokens=ANSWER_BUDGET,
                 temperature=0.7,
-                max_tokens=ANSWER_BUDGET,
-                stop_token_ids=[EOS_TOKEN_ID],
-                skip_special_tokens=False,
             )
-            phase2_responses = generate_with_vllm(llm, phase2_prompt_ids, phase2_params)
             stitch_interruptions(rollout_response_ids, needs, interruption_token_ids, phase2_responses)
-
-        destroy_vllm(llm)
 
         # Every response should decode cleanly.
         for prompt_rollouts in rollout_response_ids:

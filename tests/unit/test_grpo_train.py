@@ -1,12 +1,12 @@
-"""Unit tests for grpo_train.py — pad_token_id_pairs and generate_with_vllm."""
+"""Unit tests for grpo_train.py — pad_token_id_pairs and generate_rollouts."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
-from vllm.outputs import CompletionOutput, RequestOutput
 
 from ouro_rl.modeling import BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID
-from scripts.grpo_train import generate_with_vllm, pad_token_id_pairs
+from scripts.grpo_train import align_generation_logprobs, generate_rollouts, pad_token_id_pairs
 
 # Realistic ChatML token IDs for Ouro-Thinking.
 # <|im_start|>=1, <|im_end|>=2, <|endoftext|>=0, <think>=151648, </think>=151649
@@ -40,40 +40,6 @@ CHATML_PROMPT_IDS = [
 ]
 # response: "4\n</think>\nThe answer is 4.<|im_end|>"
 CHATML_RESPONSE_IDS = [19, NEWLINE, THINK_CLOSE, NEWLINE, 791, 4226, 374, 220, 19, 13, IM_END]
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_completion_output(
-    index: int,
-    text: str,
-    token_ids: list[int],
-    finish_reason: str = "stop",
-) -> CompletionOutput:
-    return CompletionOutput(
-        index=index,
-        text=text,
-        token_ids=token_ids,
-        cumulative_logprob=None,
-        logprobs=None,
-        finish_reason=finish_reason,
-    )
-
-
-def _make_request_output(
-    prompt_token_ids: list[int],
-    completions: list[CompletionOutput],
-) -> RequestOutput:
-    return RequestOutput(
-        request_id="fake",
-        prompt=None,
-        prompt_token_ids=prompt_token_ids,
-        prompt_logprobs=None,
-        outputs=completions,
-        finished=True,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -177,35 +143,160 @@ class TestPadTokenIdPairs:
 # ---------------------------------------------------------------------------
 
 
-class TestGenerateWithVllm:
+def _mock_model_generate(prompt_token_ids: list[list[int]], response_map: dict[int, list[list[int]]]):
+    """Build a mock model whose .generate() returns known responses.
+
+    Args:
+        prompt_token_ids: List of prompt token ID sequences.
+        response_map: {prompt_idx: [[rollout0_ids], [rollout1_ids], ...]}
+    """
+    model = MagicMock()
+    model.training = False
+    model.parameters.return_value = iter([torch.zeros(1)])  # device = cpu
+
+    n_prompts = len(prompt_token_ids)
+    max_prompt_len = max(len(ids) for ids in prompt_token_ids)
+
+    def fake_generate(input_ids, attention_mask, **kwargs):
+        num_rollouts = kwargs.get("num_return_sequences", 1)
+        # Determine max response length across all rollouts.
+        max_resp_len = 0
+        for pi in range(n_prompts):
+            for ri in range(num_rollouts):
+                resp = response_map[pi][ri]
+                max_resp_len = max(max_resp_len, len(resp))
+
+        total_len = max_prompt_len + max_resp_len
+        total_seqs = n_prompts * num_rollouts
+        sequences = torch.full((total_seqs, total_len), PAD_TOKEN_ID, dtype=torch.long)
+
+        for pi in range(n_prompts):
+            for ri in range(num_rollouts):
+                seq_idx = pi * num_rollouts + ri
+                # Copy prompt (left-padded to max_prompt_len).
+                ids = prompt_token_ids[pi]
+                pad_len = max_prompt_len - len(ids)
+                sequences[seq_idx, pad_len:max_prompt_len] = torch.tensor(ids, dtype=torch.long)
+                # Copy response.
+                resp = response_map[pi][ri]
+                sequences[seq_idx, max_prompt_len : max_prompt_len + len(resp)] = torch.tensor(resp, dtype=torch.long)
+
+        return SimpleNamespace(sequences=sequences, scores=None)
+
+    model.generate.side_effect = fake_generate
+    return model
+
+
+class TestGenerateRollouts:
     def test_output_nesting(self):
         """2 prompts × 3 rollouts → correct nesting structure."""
-        mock_llm = MagicMock()
+        prompts = [[1, 2], [3, 4, 5]]
+        responses = {
+            0: [[10], [11], [12]],
+            1: [[20, 21], [22, 23], [24, 25]],
+        }
+        model = _mock_model_generate(prompts, responses)
 
-        mock_llm.generate.return_value = [
-            _make_request_output(
-                [1, 2],
-                [
-                    _make_completion_output(0, "", [10]),
-                    _make_completion_output(1, "", [11]),
-                    _make_completion_output(2, "", [12]),
-                ],
-            ),
-            _make_request_output(
-                [3, 4, 5],
-                [
-                    _make_completion_output(0, "", [20, 21]),
-                    _make_completion_output(1, "", [22, 23]),
-                    _make_completion_output(2, "", [24, 25]),
-                ],
-            ),
-        ]
+        result_ids, result_lp = generate_rollouts(model, prompts, num_rollouts=3)
 
-        response_ids = generate_with_vllm(mock_llm, [[1, 2], [3, 4, 5]], MagicMock())
+        assert len(result_ids) == 2
+        assert len(result_ids[0]) == 3
+        assert len(result_ids[1]) == 3
+        assert result_ids[0][0] == [10]
+        assert result_ids[0][1] == [11]
+        assert result_ids[0][2] == [12]
+        assert result_ids[1][0] == [20, 21]
+        assert result_ids[1][2] == [24, 25]
+        assert result_lp is None  # return_logprobs=False by default
 
-        # response_token_ids: [prompt_idx][rollout_idx]
-        assert len(response_ids) == 2
-        assert len(response_ids[0]) == 3
-        assert len(response_ids[1]) == 3
-        assert response_ids[0][0] == [10]
-        assert response_ids[1][2] == [24, 25]
+    def test_single_rollout(self):
+        """1 prompt × 1 rollout."""
+        prompts = [[1, 2, 3]]
+        responses = {0: [[10, 20, 30]]}
+        model = _mock_model_generate(prompts, responses)
+
+        result_ids, _ = generate_rollouts(model, prompts, num_rollouts=1)
+
+        assert len(result_ids) == 1
+        assert len(result_ids[0]) == 1
+        assert result_ids[0][0] == [10, 20, 30]
+
+    def test_strips_trailing_pad(self):
+        """Trailing PAD tokens from generation are stripped."""
+        # Two prompts with different response lengths — shorter one gets padded in output.
+        prompts = [[1, 2], [3, 4]]
+        responses = {0: [[10]], 1: [[20, 30, 40]]}
+        model = _mock_model_generate(prompts, responses)
+
+        result_ids, _ = generate_rollouts(model, prompts, num_rollouts=1)
+
+        assert result_ids[0][0] == [10]  # Trailing pads stripped
+        assert result_ids[1][0] == [20, 30, 40]
+
+    def test_restores_training_mode(self):
+        """Model's training mode is restored after generate_rollouts."""
+        prompts = [[1, 2]]
+        responses = {0: [[10]]}
+        model = _mock_model_generate(prompts, responses)
+        model.training = True
+
+        generate_rollouts(model, prompts, num_rollouts=1)
+
+        model.train.assert_called_once()
+
+    def test_eval_mode_stays_eval(self):
+        """Model already in eval mode stays eval."""
+        prompts = [[1, 2]]
+        responses = {0: [[10]]}
+        model = _mock_model_generate(prompts, responses)
+        model.training = False
+
+        generate_rollouts(model, prompts, num_rollouts=1)
+
+        model.train.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestAlignGenerationLogprobs
+# ---------------------------------------------------------------------------
+
+
+class TestAlignGenerationLogprobs:
+    def test_basic_alignment(self):
+        """Logprobs placed at correct response positions, zeros elsewhere."""
+        flat_gen_logprobs = [[-0.5, -1.0, -0.3], [-0.2, -0.8]]
+        response_start_indices = torch.tensor([3, 2])
+        seq_len = 6
+
+        result = align_generation_logprobs(flat_gen_logprobs, response_start_indices, seq_len, torch.device("cpu"))
+
+        assert result.shape == (2, 6)
+        # Seq 0: logprobs at positions 3, 4, 5
+        expected_0 = torch.tensor([0.0, 0.0, 0.0, -0.5, -1.0, -0.3])
+        assert torch.allclose(result[0], expected_0)
+        # Seq 1: logprobs at positions 2, 3
+        expected_1 = torch.tensor([0.0, 0.0, -0.2, -0.8, 0.0, 0.0])
+        assert torch.allclose(result[1], expected_1)
+
+    def test_truncation_when_exceeds_seq_len(self):
+        """Logprobs truncated if they would exceed seq_len."""
+        flat_gen_logprobs = [[-0.1, -0.2, -0.3, -0.4]]
+        response_start_indices = torch.tensor([3])
+        seq_len = 5  # Only positions 3, 4 available (not 5, 6)
+
+        result = align_generation_logprobs(flat_gen_logprobs, response_start_indices, seq_len, torch.device("cpu"))
+
+        assert result.shape == (1, 5)
+        expected = torch.tensor([0.0, 0.0, 0.0, -0.1, -0.2])
+        assert torch.allclose(result[0], expected)
+
+    def test_empty_logprobs(self):
+        """Empty logprob list produces all zeros."""
+        flat_gen_logprobs = [[]]
+        response_start_indices = torch.tensor([2])
+        seq_len = 4
+
+        result = align_generation_logprobs(flat_gen_logprobs, response_start_indices, seq_len, torch.device("cpu"))
+
+        assert result.shape == (1, 4)
+        assert result[0].tolist() == [0.0, 0.0, 0.0, 0.0]

@@ -1,35 +1,32 @@
 """GRPO training loop for Ouro-1.4B-Thinking.
 
-Orchestrates: vLLM rollout generation → reward scoring → GRPO policy update.
-Supports data-parallel training and generation across multiple GPUs.
+Orchestrates: rollout generation → reward scoring → GRPO policy update.
+Supports data-parallel training across multiple GPUs.
 
 Usage:
     torchrun --standalone --nproc_per_node=1 scripts/grpo_train.py --smoke-test --no-wandb  # single GPU
     torchrun --standalone --nproc_per_node=2 scripts/grpo_train.py                          # multi-GPU
 
 Architecture:
-    - vLLM: generates rollouts (created/destroyed each step to free GPU memory)
+    - HF Transformers model.generate(): rollout generation using the policy model directly
     - HF Transformers: policy + reference model for log-prob computation + training
-    - Weight sync: save checkpoint to disk → vLLM reloads from checkpoint next step
-    - Multi-GPU: data-parallel generation (each GPU runs independent vLLM) +
-      manual gradient sync for training (no DDP wrapper, compatible with CPU↔GPU swap)
+    - Multi-GPU: data-parallel generation + manual gradient sync for training
+      (no DDP wrapper, compatible with memory-efficient workflows)
 """
 
 import argparse
-import gc
 import json
 import logging
 import os
 import random
-import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
 
 from ouro_rl.data import INTERRUPTION_PHRASE, format_prompt, load_math_train
 from ouro_rl.distributed import broadcast_object, get_rank, get_world_size, is_dist, shard_range, sync_gradients, sync_metrics
@@ -53,7 +50,7 @@ class GRPOConfig:
     model_name: str = "ByteDance/Ouro-1.4B-Thinking"
     dtype: str = "bfloat16"
     fp32_lm_head: bool = False  # Upcast lm_head matmul to fp32 (ScaleRL fix). Disable on low VRAM.
-    max_model_len: int = 6144  # vLLM context window (prompt avg 89, response p75 = 2793)
+    max_model_len: int = 6144  # Max sequence length (prompt avg 89, response p75 = 2793)
 
     # Dataset
     dataset_name: str = "qwedsacf/competition_math"
@@ -74,7 +71,7 @@ class GRPOConfig:
     truncation_max: float = 5.0  # CISPO: IS ratio cap (insensitive to choice in {4, 5, 8})
     kl_coeff: float = 0.0  # KL not needed with verifiable rewards (DAPO, Open-Reasoner-Zero)
     scale_rewards: str = "batch"  # "batch" (group mean, batch std), "group" (per-group std), "none" (no std)
-    num_iterations: int = 1  # μ: number of policy updates per generation batch (ScaleRL uses μ=2)
+    num_iterations: int = 2  # μ: number of policy updates per generation batch (ScaleRL uses μ=2)
     token_level_loss: bool = True  # Token-level average (avoids length bias) vs per-sequence average
 
     # Generation
@@ -90,6 +87,7 @@ class GRPOConfig:
     answer_budget: int = 512  # max tokens for answer after interruption
 
     # Memory
+    generation_batch_size: int = 2  # prompts per model.generate() call (×rollouts_per_prompt sequences)
     log_prob_micro_batch: int = 4  # micro-batch for log-prob forward passes
     train_micro_batch: int = 2  # micro-batch for training forward/backward
 
@@ -97,7 +95,6 @@ class GRPOConfig:
     output_dir: str = "outputs/grpo"
     log_every: int = 1
     save_every: int = 10
-    keep_last_n_checkpoints: int = 2  # Delete older checkpoints to save disk (0 = keep all)
     wandb_project: str = "ouro-rl"
     wandb_run_name: str | None = None
     wandb_enabled: bool = True
@@ -130,87 +127,139 @@ class GRPOConfig:
 
 
 # ---------------------------------------------------------------------------
-# vLLM rollout generation
+# Rollout generation (HF model.generate)
 # ---------------------------------------------------------------------------
 
 
-# Env vars set by torchrun that must be cleared before spawning vLLM.
-# The EngineCore child process inherits these and tries to init_process_group
-# against the training group it's not part of, causing a 600s TCP timeout.
-_TORCHRUN_ENV_VARS = ("MASTER_ADDR", "MASTER_PORT", "RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "GROUP_RANK")
-
-
-def create_vllm(
-    model_path: str,
-    *,
-    dtype: str = "bfloat16",
-    max_model_len: int = 4096,
-    trust_remote_code: bool = True,
-    gpu_id: int = 0,
-) -> LLM:
-    """Create a vLLM LLM instance for generation.
-
-    Env var isolation for torchrun + per-rank vLLM:
-    1. CUDA_VISIBLE_DEVICES — vLLM defaults to GPU 0; we restrict visibility
-       so the spawned EngineCore child binds to the correct physical GPU.
-    2. Torchrun env vars — the child inherits MASTER_ADDR/PORT/RANK/WORLD_SIZE
-       and tries to join the training process group (→ 600s timeout). We clear
-       these so vLLM creates its own isolated group.
-    3. VLLM_HOST_IP — vLLM discovers the machine's external IP via UDP, but
-       cluster firewalls may block self-connections on the external IP. We force
-       localhost since each vLLM instance is single-GPU (world_size=1).
-
-    The parent process's CUDA context is already initialized and unaffected
-    by env var changes. All vars are restored after the child is spawned.
-    """
-    saved_env: dict[str, str] = {}
-    for var in (*_TORCHRUN_ENV_VARS, "CUDA_VISIBLE_DEVICES", "VLLM_HOST_IP"):
-        if var in os.environ:
-            saved_env[var] = os.environ.pop(var)
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    os.environ["VLLM_HOST_IP"] = "127.0.0.1"
-    try:
-        return LLM(
-            model=model_path,
-            trust_remote_code=trust_remote_code,
-            dtype=dtype,
-            max_model_len=max_model_len,
-            enforce_eager=True,  # Simpler, avoids CUDA graph issues with model swapping.
-            skip_tokenizer_init=True,
-        )
-    finally:
-        # Remove any vars we set, then restore originals.
-        for var in (*_TORCHRUN_ENV_VARS, "CUDA_VISIBLE_DEVICES", "VLLM_HOST_IP"):
-            os.environ.pop(var, None)
-        os.environ.update(saved_env)
-
-
-def destroy_vllm(llm: LLM) -> None:
-    """Destroy a vLLM LLM instance and free GPU memory."""
-    del llm
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-def generate_with_vllm(
-    llm: LLM,
+@torch.no_grad()
+def generate_rollouts(
+    model: OuroForCausalLM,
     prompt_token_ids: list[list[int]],
-    sampling_params: SamplingParams,
-) -> list[list[list[int]]]:
-    """Generate rollouts using an existing vLLM instance.
+    *,
+    num_rollouts: int = 1,
+    max_new_tokens: int = 256,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    return_logprobs: bool = False,
+    batch_size: int = 0,
+) -> tuple[list[list[list[int]]], list[list[list[float]]] | None]:
+    """Generate rollouts using HF model.generate().
 
-    Accepts pre-tokenized prompt_token_ids (vLLM was created with
-    skip_tokenizer_init=True). Number of rollouts per prompt is controlled
-    by sampling_params.n.
+    Uses the policy model directly — no separate vLLM process, no weight sync,
+    no memory leaks. ``num_rollouts`` controls how many completions per prompt
+    (equivalent to vLLM's ``n`` parameter).
+
+    Args:
+        model: The policy model (already on GPU).
+        prompt_token_ids: Pre-tokenized prompts as lists of token IDs.
+        num_rollouts: Number of completions per prompt.
+        max_new_tokens: Maximum response tokens to generate.
+        temperature: Sampling temperature.
+        top_p: Nucleus sampling threshold.
+        return_logprobs: If True, capture per-token log-probs from generation
+            (useful as old_log_probs when num_iterations > 1).
+        batch_size: Number of prompts per model.generate() call. Each call
+            produces batch_size × num_rollouts sequences. 0 = all at once.
 
     Returns:
-        response_token_ids: [prompt_idx][rollout_idx] list of token ID lists.
+        (response_ids, generation_logprobs) where:
+        - response_ids[prompt_idx][rollout_idx] → list of token IDs
+        - generation_logprobs[prompt_idx][rollout_idx] → list of per-token
+          log-probs (same length as the corresponding response), or None
     """
-    outputs = llm.generate(
-        [{"prompt_token_ids": ids} for ids in prompt_token_ids],
-        sampling_params,
-    )
-    return [[list(out.token_ids) for out in output.outputs] for output in outputs]
+    was_training = model.training
+    model.eval()
+    device = next(model.parameters()).device
+
+    n_prompts = len(prompt_token_ids)
+    if batch_size <= 0:
+        batch_size = n_prompts
+
+    all_response_ids: list[list[list[int]]] = []
+    all_logprobs: list[list[list[float]]] | None = [] if return_logprobs else None
+
+    for chunk_start in range(0, n_prompts, batch_size):
+        chunk_end = min(chunk_start + batch_size, n_prompts)
+        chunk_prompts = prompt_token_ids[chunk_start:chunk_end]
+        chunk_size = len(chunk_prompts)
+
+        # Left-pad this chunk for batched generation.
+        max_prompt_len = max(len(ids) for ids in chunk_prompts)
+        input_ids = torch.full((chunk_size, max_prompt_len), PAD_TOKEN_ID, dtype=torch.long, device=device)
+        attention_mask = torch.zeros(chunk_size, max_prompt_len, dtype=torch.long, device=device)
+        for i, ids in enumerate(chunk_prompts):
+            pad_len = max_prompt_len - len(ids)
+            input_ids[i, pad_len:] = torch.tensor(ids, dtype=torch.long, device=device)
+            attention_mask[i, pad_len:] = 1
+
+        outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=True,
+            num_return_sequences=num_rollouts,
+            eos_token_id=EOS_TOKEN_ID,
+            pad_token_id=PAD_TOKEN_ID,
+            output_scores=return_logprobs,
+            return_dict_in_generate=True,
+        )
+
+        # Extract response token IDs (strip prompt, strip trailing pad).
+        full_ids = outputs.sequences  # (chunk_size * num_rollouts, max_prompt_len + max_gen_len)
+        for pi in range(chunk_size):
+            rollouts = []
+            for ri in range(num_rollouts):
+                seq_idx = pi * num_rollouts + ri
+                resp = full_ids[seq_idx, max_prompt_len:].tolist()
+                while resp and resp[-1] == PAD_TOKEN_ID:
+                    resp.pop()
+                rollouts.append(resp)
+            all_response_ids.append(rollouts)
+
+        # Extract per-token log-probs if requested.
+        if return_logprobs and outputs.scores:
+            scores = torch.stack(outputs.scores, dim=1)  # (total_seqs, num_steps, vocab)
+            log_probs = F.log_softmax(scores, dim=-1)
+            generated_tokens = full_ids[:, max_prompt_len:]
+            num_steps = scores.shape[1]
+            generated_tokens = generated_tokens[:, :num_steps]
+            token_log_probs = log_probs.gather(-1, generated_tokens.unsqueeze(-1)).squeeze(-1)
+
+            for pi in range(chunk_size):
+                rollouts_lp = []
+                for ri in range(num_rollouts):
+                    seq_idx = pi * num_rollouts + ri
+                    resp_len = len(all_response_ids[chunk_start + pi][ri])
+                    rollouts_lp.append(token_log_probs[seq_idx, :resp_len].tolist())
+                all_logprobs.append(rollouts_lp)
+
+    if was_training:
+        model.train()
+
+    return all_response_ids, all_logprobs if all_logprobs else None
+
+
+def align_generation_logprobs(
+    flat_gen_logprobs: list[list[float]],
+    response_start_indices: torch.Tensor,
+    seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Align per-sequence generation log-probs into the padded training tensor format.
+
+    Returns a (batch, seq_len) tensor matching the output format of
+    ``compute_log_probs_batch``: log-probs at response positions, zeros elsewhere.
+    """
+    batch_size = len(flat_gen_logprobs)
+    aligned = torch.zeros(batch_size, seq_len, device=device)
+    for i, lps in enumerate(flat_gen_logprobs):
+        start = response_start_indices[i].item()
+        end = min(start + len(lps), seq_len)
+        n = end - start
+        aligned[i, start:end] = torch.tensor(lps[:n], device=device)
+    return aligned
 
 
 def find_truncated_completions(
@@ -330,10 +379,16 @@ def train_step(
     tokenized: dict[str, torch.Tensor],
     advantages: torch.Tensor,
     config: GRPOConfig,
+    old_log_probs: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Single GRPO gradient update with micro-batching.
 
     When config.kl_coeff == 0, ref_model can be None and ref log-probs are skipped.
+
+    Args:
+        old_log_probs: Pre-computed log-probs from generation time (frozen π_old).
+            When provided and num_iterations > 1, skips the forward pass to compute
+            them. When None and num_iterations > 1, computes from policy_model.
 
     Returns aggregated metrics dict.
     """
@@ -362,8 +417,7 @@ def train_step(
     # Compute old log-probs only when num_iterations > 1 (the frozen snapshot anchors the
     # clipping ratio across multiple optimization passes over the same rollouts).
     # With num_iterations == 1, old == policy so ratio is always 1.0 and clipping is a no-op.
-    old_log_probs = None
-    if config.num_iterations > 1:
+    if old_log_probs is None and config.num_iterations > 1:
         old_log_probs = compute_log_probs_batch(
             policy_model,
             input_ids,
@@ -482,23 +536,6 @@ def main(config: GRPOConfig) -> None:
     if rank == 0:
         logger.info("Loaded %d problems", len(problems))
 
-    # vLLM sampling params.
-    # NOTE: stop_token_ids is required because the upstream Ouro model ships
-    # with eos_token_id=0 (<|endoftext|>) in both tokenizer and model config.
-    # vLLM reads that and never stops on <|im_end|> (id=2), causing every
-    # completion to hit max_tokens and be flagged as truncated.
-    sampling_params = SamplingParams(
-        n=config.rollouts_per_prompt,
-        temperature=config.temperature,
-        top_p=config.top_p,
-        max_tokens=config.max_new_tokens,
-        stop_token_ids=[EOS_TOKEN_ID],
-        skip_special_tokens=False,  # Keep <think>...</think> for reward parsing.
-    )
-
-    # The current model path — starts as the base model, updated after checkpoints.
-    current_model_path = config.model_name
-
     # Load policy + reference models for training.
     torch_dtype = getattr(torch, config.dtype)
     if rank == 0:
@@ -562,24 +599,11 @@ def main(config: GRPOConfig) -> None:
             format_prompt(p, tokenizer, system_prompt=config.system_prompt, enable_thinking=config.enable_thinking)
             for p in batch_problems
         ]
-        # Tokenize prompts once with correctly-configured HF tokenizer.
-        # vLLM receives token IDs directly, bypassing its internal tokenizer
-        # (which has wrong bos/eos/pad from upstream Ouro config).
         prompt_token_ids = [tokenizer.encode(p) for p in prompts]
 
-        # --- 2. Generate rollouts with vLLM (data-parallel) ---
+        # --- 2. Generate rollouts (data-parallel, HF model.generate) ---
         if rank == 0:
             logger.info("[Step %d/%d] Generating %d rollouts...", step, config.num_steps, config.total_rollouts_per_step)
-
-        # Move training models + optimizer state to CPU to free GPU memory for vLLM.
-        policy_model.cpu()
-        if ref_model is not None:
-            ref_model.cpu()
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.cpu()
-        torch.cuda.empty_cache()
 
         gen_start = time.time()
         n_interrupted = 0
@@ -589,23 +613,27 @@ def main(config: GRPOConfig) -> None:
         my_prompt_token_ids = prompt_token_ids[my_start:my_end]
         my_num_prompts = len(my_prompt_token_ids)
 
+        # Capture generation logprobs when num_iterations > 1 (reused as old_log_probs
+        # in train_step, saving a full forward pass per training step).
+        capture_logprobs = config.num_iterations > 1
+        my_gen_logprobs: list[list[list[float]]] | None = None
+
         if config.enable_interruptions:
             # Two-phase generation: thinking → interruption → answer.
             # Sync thinking budget so all ranks use the same value.
             thinking_budget = random.randint(config.thinking_budget_min, config.thinking_budget_max) if rank == 0 else 0
             thinking_budget = broadcast_object(thinking_budget)
 
-            phase1_params = SamplingParams(
-                n=config.rollouts_per_prompt,
+            # Phase 1: generate thinking tokens (can't capture logprobs — stitching invalidates them).
+            my_rollout_ids, _ = generate_rollouts(
+                policy_model,
+                my_prompt_token_ids,
+                num_rollouts=config.rollouts_per_prompt,
+                max_new_tokens=thinking_budget,
                 temperature=config.temperature,
                 top_p=config.top_p,
-                max_tokens=thinking_budget,
-                stop_token_ids=[EOS_TOKEN_ID],
-                skip_special_tokens=False,
+                batch_size=config.generation_batch_size,
             )
-
-            llm = create_vllm(current_model_path, dtype=config.dtype, max_model_len=config.max_model_len, gpu_id=local_rank)
-            my_rollout_ids = generate_with_vllm(llm, my_prompt_token_ids, phase1_params)
 
             # Identify truncated completions on this rank's subset.
             think_close_id = tokenizer.convert_tokens_to_ids("</think>")
@@ -620,19 +648,17 @@ def main(config: GRPOConfig) -> None:
                     my_prompt_token_ids[pi] + my_rollout_ids[pi][ri] + interruption_token_ids for pi, ri in needs_interruption
                 ]
 
-                phase2_params = SamplingParams(
-                    n=1,
+                phase2_responses, _ = generate_rollouts(
+                    policy_model,
+                    phase2_prompt_ids,
+                    num_rollouts=1,
+                    max_new_tokens=config.answer_budget,
                     temperature=config.temperature,
                     top_p=config.top_p,
-                    max_tokens=config.answer_budget,
-                    stop_token_ids=[EOS_TOKEN_ID],
-                    skip_special_tokens=False,
+                    batch_size=config.generation_batch_size,
                 )
-                phase2_responses = generate_with_vllm(llm, phase2_prompt_ids, phase2_params)
 
                 stitch_interruptions(my_rollout_ids, needs_interruption, interruption_token_ids, phase2_responses)
-
-            destroy_vllm(llm)
 
             # Sum interrupted counts across ranks for logging.
             n_interrupted_t = torch.tensor([my_n_interrupted], device=device, dtype=torch.long)
@@ -649,13 +675,20 @@ def main(config: GRPOConfig) -> None:
                     config.total_rollouts_per_step,
                 )
         else:
-            llm = create_vllm(current_model_path, dtype=config.dtype, max_model_len=config.max_model_len, gpu_id=local_rank)
-            my_rollout_ids = generate_with_vllm(llm, my_prompt_token_ids, sampling_params)
-            destroy_vllm(llm)
+            my_rollout_ids, my_gen_logprobs = generate_rollouts(
+                policy_model,
+                my_prompt_token_ids,
+                num_rollouts=config.rollouts_per_prompt,
+                max_new_tokens=config.max_new_tokens,
+                temperature=config.temperature,
+                top_p=config.top_p,
+                return_logprobs=capture_logprobs,
+                batch_size=config.generation_batch_size,
+            )
 
         gen_time = time.time() - gen_start
 
-        # Decode local rollout token IDs to text (vLLM skips tokenizer, so we do it here).
+        # Decode rollout token IDs to text.
         rollout_texts = [[tokenizer.decode(ids) for ids in prompt_rollouts] for prompt_rollouts in my_rollout_ids]
 
         # Completion length stats (local, synced across ranks for logging).
@@ -685,15 +718,6 @@ def main(config: GRPOConfig) -> None:
             min_completion_len = int(min_t.item())
         completion_log_data["completions/max_length"] = max_completion_len
         completion_log_data["completions/min_length"] = min_completion_len
-
-        # Move training models + optimizer state back to GPU.
-        policy_model.to(device)
-        if ref_model is not None:
-            ref_model.to(device)
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(device)
 
         # --- 3. Score rollouts (each rank scores its own subset) ---
         rewards_list: list[list[float]] = []
@@ -775,6 +799,19 @@ def main(config: GRPOConfig) -> None:
         pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         tokenized = pad_token_id_pairs(flat_prompt_ids, flat_response_ids, max_length, pad_token_id=pad_id)
 
+        # Build old_log_probs from generation if available (saves a forward pass per train_step).
+        old_log_probs = None
+        if my_gen_logprobs is not None:
+            flat_gen_logprobs = [
+                my_gen_logprobs[i][j] for i in range(my_num_prompts) for j in range(config.rollouts_per_prompt)
+            ]
+            old_log_probs = align_generation_logprobs(
+                flat_gen_logprobs,
+                tokenized["response_start_indices"],
+                tokenized["input_ids"].shape[1],
+                device,
+            )
+
         # --- 6. GRPO update (μ iterations per generation batch) ---
         train_start = time.time()
         for _iteration in range(config.num_iterations):
@@ -786,6 +823,7 @@ def main(config: GRPOConfig) -> None:
                 tokenized,
                 flat_advantages,
                 config,
+                old_log_probs=old_log_probs,
             )
         train_time = time.time() - train_start
 
@@ -839,18 +877,8 @@ def main(config: GRPOConfig) -> None:
                 logger.info("Saving checkpoint to %s", ckpt_dir)
                 policy_model.save_pretrained(ckpt_dir)
                 tokenizer.save_pretrained(ckpt_dir)
-
-                # Delete old checkpoints to save disk space.
-                if config.keep_last_n_checkpoints > 0:
-                    existing = sorted(output_dir.glob("step_*"))
-                    to_delete = existing[: -config.keep_last_n_checkpoints]
-                    for old_ckpt in to_delete:
-                        logger.info("Deleting old checkpoint: %s", old_ckpt)
-                        shutil.rmtree(old_ckpt)
             if is_dist():
                 dist.barrier()  # Ensure checkpoint is written before any rank reads it.
-            # Update model path for vLLM to load from checkpoint next step.
-            current_model_path = str(ckpt_dir)
 
     # Final save.
     final_dir = output_dir / "final"
