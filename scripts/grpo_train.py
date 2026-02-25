@@ -525,6 +525,16 @@ def main(config: GRPOConfig) -> None:
     # The current model path — starts as the base model, updated after checkpoints.
     current_model_path = config.model_name
 
+    # Resolve custom code files (configuration_ouro.py, modeling_ouro.py) from HF cache
+    # so we can copy them into checkpoints — vLLM needs them for trust_remote_code.
+    from huggingface_hub import try_to_load_from_cache
+
+    _custom_code_files: list[Path] = []
+    for fname in ("configuration_ouro.py", "modeling_ouro.py"):
+        cached = try_to_load_from_cache(config.model_name, fname)
+        if isinstance(cached, str):
+            _custom_code_files.append(Path(cached))
+
     # Load policy + reference models for training.
     torch_dtype = getattr(torch, config.dtype)
     if rank == 0:
@@ -863,6 +873,8 @@ def main(config: GRPOConfig) -> None:
                 logger.info("Saving checkpoint to %s", ckpt_dir)
                 policy_model.save_pretrained(ckpt_dir)
                 tokenizer.save_pretrained(ckpt_dir)
+                for src in _custom_code_files:
+                    shutil.copy2(src, ckpt_dir / src.name)
 
                 # Delete old checkpoints to save disk space.
                 if config.keep_last_n_checkpoints > 0:
@@ -881,6 +893,8 @@ def main(config: GRPOConfig) -> None:
     if rank == 0:
         policy_model.save_pretrained(final_dir)
         tokenizer.save_pretrained(final_dir)
+        for src in _custom_code_files:
+            shutil.copy2(src, final_dir / src.name)
         logger.info("Training complete. Final model saved to %s", final_dir)
 
     if config.wandb_enabled and rank == 0:
