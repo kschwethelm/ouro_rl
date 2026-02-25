@@ -58,7 +58,7 @@ class GRPOConfig:
 
     # Training
     num_steps: int = 140
-    prompt_batch_size: int = 32
+    prompts_per_step: int = 32
     rollouts_per_prompt: int = 8
     lr: float = 1e-6
     max_grad_norm: float = 0.1
@@ -108,7 +108,7 @@ class GRPOConfig:
     def __post_init__(self) -> None:
         if self.smoke_test:
             self.num_steps = 3
-            self.prompt_batch_size = 4
+            self.prompts_per_step = 4
             self.rollouts_per_prompt = 4
             self.save_every = 1
             self.max_new_tokens = 256
@@ -123,7 +123,7 @@ class GRPOConfig:
     # Derived
     @property
     def total_rollouts_per_step(self) -> int:
-        return self.prompt_batch_size * self.rollouts_per_prompt
+        return self.prompts_per_step * self.rollouts_per_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -500,8 +500,8 @@ def main(config: GRPOConfig) -> None:
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
-    assert config.prompt_batch_size % world_size == 0, (
-        f"prompt_batch_size ({config.prompt_batch_size}) must be divisible by world_size ({world_size})"
+    assert config.prompts_per_step % world_size == 0, (
+        f"prompts_per_step ({config.prompts_per_step}) must be divisible by world_size ({world_size})"
     )
 
     set_seed(config.seed)
@@ -590,7 +590,7 @@ def main(config: GRPOConfig) -> None:
         step_start = time.time()
 
         # --- 1. Sample prompts (rank 0 → broadcast) ---
-        indices = random.sample(range(len(problems)), config.prompt_batch_size) if rank == 0 else None
+        indices = random.sample(range(len(problems)), config.prompts_per_step) if rank == 0 else None
         indices = broadcast_object(indices)
         batch_problems = [problems[i] for i in indices]
         batch_solutions = [solutions[i] for i in indices]
@@ -906,7 +906,7 @@ def parse_args() -> GRPOConfig:
     p.add_argument("--model", dest="model_name")
     p.add_argument("--dataset", dest="dataset_name")
     p.add_argument("--num-steps", type=int)
-    p.add_argument("--prompt-batch-size", type=int)
+    p.add_argument("--prompts-per-step", type=int)
     p.add_argument("--rollouts-per-prompt", type=int)
     p.add_argument("--lr", type=float)
     p.add_argument("--kl-coeff", type=float)
