@@ -32,6 +32,10 @@ class PackedBatch:
     Each row is a 1-D tensor of token IDs (no tail padding) containing one or more
     concatenated sequences.  ``position_ids`` reset to 0 at each sequence boundary
     so FlashAttention can infer ``cu_seqlens`` for block-diagonal attention.
+
+    Row length is bounded by ``pack_len`` (not ``max_model_len``): individual
+    sequence positions stay within the model's context window, but a row can
+    concatenate many sequences to improve GPU utilization.
     """
 
     # Per-row tensors (variable length — processed one at a time with batch_size=1).
@@ -49,20 +53,26 @@ def pack_sequences(
     prompt_ids_list: list[list[int]],
     response_ids_list: list[list[int]],
     max_pack_len: int,
+    max_seq_len: int | None = None,
 ) -> PackedBatch:
     """Bin-pack prompt+response pairs into packed rows using first-fit-decreasing.
 
     Each packed row's total token count is ≤ ``max_pack_len``.  Sequences are never
-    split across rows.
+    split across rows.  Individual sequences are truncated to ``max_seq_len``
+    (defaults to ``max_pack_len`` for backward compatibility).
 
     Args:
         prompt_ids_list: Token IDs for each prompt.
         response_ids_list: Token IDs for each response.
-        max_pack_len: Maximum tokens per packed row.
+        max_pack_len: Maximum tokens per packed row (controls GPU saturation).
+        max_seq_len: Maximum tokens per individual sequence (model context window).
 
     Returns:
         PackedBatch with packed rows and per-sequence metadata.
     """
+    if max_seq_len is None:
+        max_seq_len = max_pack_len
+
     n = len(prompt_ids_list)
     assert n == len(response_ids_list)
 
@@ -76,9 +86,9 @@ def pack_sequences(
 
     for si in sorted_indices:
         seq_len = lengths[si]
-        if seq_len > max_pack_len:
-            # Truncate response to fit (same as pad_token_id_pairs does).
-            seq_len = max_pack_len
+        if seq_len > max_seq_len:
+            # Truncate response to fit within model context window.
+            seq_len = max_seq_len
 
         # Find first bin that fits.
         placed = False
@@ -106,10 +116,10 @@ def pack_sequences(
             total_len = len(prompt) + len(response)
 
             # Truncate if needed (same policy as pad_token_id_pairs).
-            if total_len > max_pack_len:
-                max_resp = max_pack_len - len(prompt)
+            if total_len > max_seq_len:
+                max_resp = max_seq_len - len(prompt)
                 if max_resp <= 0:
-                    prompt = prompt[-(max_pack_len - 1) :]
+                    prompt = prompt[-(max_seq_len - 1) :]
                     response = response[:1]
                 else:
                     response = response[:max_resp]

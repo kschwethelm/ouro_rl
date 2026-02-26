@@ -102,8 +102,7 @@ class GRPOConfig:
 
     # Memory
     gradient_checkpointing: bool = True  # trade compute for memory (saves ~77 GB activations)
-    log_prob_micro_batch: int = 16  # micro-batch for log-prob forward passes
-    train_micro_batch: int = 16  # micro-batch for training forward/backward
+    pack_len: int = 90000  # max tokens per packed forward pass (controls GPU saturation)
 
     # Logging & checkpointing
     output_dir: str = "outputs/grpo"
@@ -128,8 +127,7 @@ class GRPOConfig:
             self.save_every = 1
             self.max_new_tokens = 256
             self.max_model_len = 512
-            self.log_prob_micro_batch = 1
-            self.train_micro_batch = 1
+            self.pack_len = 1024
             if self.enable_interruptions:
                 self.thinking_budget_min = 128
                 self.thinking_budget_max = 192
@@ -379,8 +377,10 @@ def train_step(
 ) -> dict[str, float]:
     """Single GRPO gradient update using packed forward passes.
 
-    Each packed row is processed as a single forward pass (batch_size=1).
-    FlashAttention's varlen support provides block-diagonal attention.
+    Sequences are packed into rows of up to ``config.pack_len`` tokens.
+    Each row is forwarded as batch_size=1; FlashAttention's varlen support
+    provides block-diagonal attention across sequences within the row.
+    Larger pack_len → fewer forward passes, better GPU saturation.
 
     When config.kl_coeff == 0, ref_model can be None and ref log-probs are skipped.
 
@@ -533,7 +533,9 @@ def main(config: GRPOConfig) -> None:
         logger.info("Loading MATH dataset: %s", config.dataset_name)
     dataset = load_math_train(config.dataset_name)
     if config.min_level is not None:
-        dataset = dataset.filter(lambda x: x["level"].startswith("Level") and x["level"][-1].isdigit() and int(x["level"][-1]) >= config.min_level)
+        dataset = dataset.filter(
+            lambda x: x["level"].startswith("Level") and x["level"][-1].isdigit() and int(x["level"][-1]) >= config.min_level
+        )
     problems = dataset["problem"]
     solutions = dataset["solution"]
     if rank == 0:
@@ -560,7 +562,7 @@ def main(config: GRPOConfig) -> None:
         attn_implementation = "flash_attention_2"
     else:
         attn_implementation = "eager"
-    
+
     logger.info("[rank %d] Attention implementation: %s", rank, attn_implementation)
     if rank == 0:
         logger.info("Loading policy model: %s", config.model_name)
@@ -834,14 +836,17 @@ def main(config: GRPOConfig) -> None:
             continue
 
         # Pack local batch into packed rows for efficient forward passes.
-        packed = pack_sequences(flat_prompt_ids, flat_response_ids, config.max_model_len)
+        packed = pack_sequences(flat_prompt_ids, flat_response_ids, config.pack_len, max_seq_len=config.max_model_len)
+        avg_pack_len = sum(len(r) for r in packed.row_ids) / packed.num_rows
         if rank == 0:
             logger.info(
-                "[Step %d/%d] Packed %d sequences into %d rows",
+                "[Step %d/%d] Packed %d sequences into %d rows (pack_len=%d, avg_row_len=%.0f)",
                 step,
                 config.num_steps,
                 packed.num_sequences,
                 packed.num_rows,
+                config.pack_len,
+                avg_pack_len,
             )
 
         # --- 6. GRPO update (μ iterations per generation batch) ---
@@ -870,6 +875,7 @@ def main(config: GRPOConfig) -> None:
             "reward/fraction_correct": fraction_correct,
             "reward/frac_zero_std": frac_reward_zero_std,
             **completion_log_data,
+            "train/avg_pack_len": avg_pack_len,
             "time/step_total": step_time,
             "time/generation": gen_time,
             "time/training": train_time,
@@ -970,8 +976,7 @@ def parse_args() -> GRPOConfig:
     p.add_argument("--thinking-budget-max", type=int)
     p.add_argument("--answer-budget", type=int)
     p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--train-micro-batch", type=int)
-    p.add_argument("--log-prob-micro-batch", type=int)
+    p.add_argument("--pack-len", type=int)
     p.add_argument("--output-dir")
     p.add_argument("--save-every", type=int)
     p.add_argument("--smoke-test", action=argparse.BooleanOptionalAction, default=None)

@@ -188,6 +188,61 @@ def _per_layer_activation(B: int, S: int, H: int, FF: int, n_heads: int, n_kv: i
     return attn_total + norms + mlp_gate_up + mlp_act + residuals
 
 
+def activation_bytes_per_token(cfg: dict, dtype_bytes: int, gradient_checkpointing: bool) -> float:
+    """Return bytes of activation memory per token for micro_batch=1.
+
+    All terms are O(S) with FlashAttention (no S×S matrix), so activation
+    memory = coeff * S, making max pack_len analytically solvable.
+    """
+    H = cfg["hidden_size"]
+    FF = cfg["intermediate_size"]
+    n_heads = cfg["num_attention_heads"]
+    n_kv = cfg["num_key_value_heads"]
+    head_dim = H // n_heads
+    effective_layers = cfg["num_hidden_layers"] * cfg["total_ut_steps"]
+    d = dtype_bytes
+
+    # Per-layer activation cost per token (S=1, B=1)
+    attn_qkv = (n_heads + 2 * n_kv) * head_dim * d
+    attn_out = H * d
+    softmax_lse = n_heads * 4  # float32 LSE per head (B=1)
+    norms = 4 * H * d
+    mlp_gate_up = 2 * FF * d
+    mlp_act = FF * d
+    residuals = 2 * H * d
+    full_layer_cost = attn_qkv + attn_out + softmax_lse + norms + mlp_gate_up + mlp_act + residuals
+
+    if gradient_checkpointing:
+        # Store only layer input (H*d per token); recompute one layer on backward.
+        stored_cost = effective_layers * H * d
+        recompute_cost = full_layer_cost  # peak during recompute of one layer
+        layer_cost = stored_cost + recompute_cost
+    else:
+        layer_cost = effective_layers * full_layer_cost
+
+    # Logits + log_softmax (materialized for NLL loss)
+    logits_cost = 2 * cfg["vocab_size"] * d
+
+    return layer_cost + logits_cost
+
+
+def solve_max_pack_len(
+    cfg: dict,
+    fixed_bytes: float,
+    gpu_memory_gb: float,
+    dtype_bytes: int,
+    gradient_checkpointing: bool,
+    cuda_overhead_gb: float = 0.5,
+) -> int:
+    """Solve for the largest pack_len that fits in GPU memory (micro_batch=1)."""
+    available = (gpu_memory_gb - cuda_overhead_gb) * 2**30
+    activation_budget = available - fixed_bytes
+    coeff = activation_bytes_per_token(cfg, dtype_bytes, gradient_checkpointing)
+    if coeff <= 0 or activation_budget <= 0:
+        return 0
+    return int(activation_budget / coeff)
+
+
 def estimate_optimizer_memory(num_params: int, dtype_bytes: int) -> dict[str, float]:
     """AdamW optimizer state: 2 fp32 states (mean, variance) + fp32 param copy."""
     # AdamW stores:
@@ -383,13 +438,30 @@ def main():
     print(f"    Peak:           {fmt_gb(lp_peak)}")
     print()
 
-    # ── 7. Recommendations ───────────────────────────────────────────────
-    print(f"{'=' * 72}")
-    print("RECOMMENDATIONS")
-    print(f"{'=' * 72}")
-
     current_act = estimate_activation_memory(cfg, args.train_micro_batch, args.max_seq_len, d, args.gradient_checkpointing)
     current_peak = fixed + current_act["peak_activations"]
+
+    # ── 7. Packed training: max pack_len ─────────────────────────────────
+    print(f"{'─' * 72}")
+    print("7. PACKED TRAINING — max pack_len (micro_batch=1)")
+    print(f"{'─' * 72}")
+    print("  Activation memory is O(S) with FlashAttention → analytically solvable.")
+    print()
+    for gc in (True, False):
+        max_pl = solve_max_pack_len(cfg, fixed, args.gpu_memory_gb, d, gc)
+        gc_str = "with gradient checkpointing" if gc else "without gradient checkpointing"
+        coeff = activation_bytes_per_token(cfg, d, gc)
+        act_at_max = coeff * max_pl
+        print(f"  {gc_str}:")
+        print(f"    Activation cost/token:  {coeff / 1024:.1f} KB/tok")
+        print(f"    Max pack_len:           {max_pl:,} tokens")
+        print(f"    Activation at max:      {fmt_gb(act_at_max)}")
+        print(f"    Total peak at max:      {fmt_gb(fixed + act_at_max)}")
+        print()
+
+    print(f"{'=' * 72}")
+    print("8. RECOMMENDATIONS")
+    print(f"{'=' * 72}")
 
     if current_peak > gpu_bytes - cuda_overhead:
         print("\n  Current config exceeds GPU memory. Options:")

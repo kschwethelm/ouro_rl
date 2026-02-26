@@ -1,6 +1,5 @@
 """Unit tests for ouro_rl/packing.py — bin-packing and log-prob extraction."""
 
-
 from ouro_rl.packing import pack_sequences
 
 
@@ -104,6 +103,35 @@ class TestPackSequences:
         # Both have len 3, so original order is preserved.
         # positions: [0,1,2, 0,1,2]
         assert pos.count(0) >= 2  # at least 2 sequences start with position 0
+
+    def test_max_seq_len_truncates_but_pack_len_bins(self):
+        """max_seq_len truncates individual sequences; max_pack_len controls bin capacity."""
+        # 2 sequences, each prompt=3 + response=5 = 8 tokens.
+        # max_seq_len=6 truncates each to 6 tokens.
+        # max_pack_len=12 lets both fit in one row (6+6=12).
+        packed = pack_sequences(
+            [[1, 2, 3], [4, 5, 6]],
+            [[10, 11, 12, 13, 14], [20, 21, 22, 23, 24]],
+            max_pack_len=12,
+            max_seq_len=6,
+        )
+        assert packed.num_sequences == 2
+        assert packed.num_rows == 1  # both fit in one row
+        for info in packed.seq_infos:
+            assert info.total_len == 6  # truncated to max_seq_len, not max_pack_len
+
+    def test_pack_len_larger_than_seq_len(self):
+        """pack_len > max_seq_len: multiple sequences packed into long rows."""
+        # 4 sequences of len 3 each, max_seq_len=5 (no truncation needed),
+        # max_pack_len=20 → all 4 fit in one row (3*4=12 <= 20).
+        packed = pack_sequences(
+            [[1], [2], [3], [4]],
+            [[10, 11], [20, 21], [30, 31], [40, 41]],
+            max_pack_len=20,
+            max_seq_len=5,
+        )
+        assert packed.num_rows == 1
+        assert packed.row_ids[0].shape[0] == 12  # 4 sequences * 3 tokens
 
 
 class TestPackSequencesEdgeCases:
